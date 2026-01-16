@@ -30,7 +30,7 @@ use crate::{
         WaitAfterBuffered,
     },
     player::{
-        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Panic, PanicTo,
+        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Move, Panic, PanicTo,
         PingPong, PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant,
         UseBooster,
     },
@@ -137,6 +137,7 @@ pub enum RotatorMode {
     StartToEndThenReverse,
     AutoMobbing(MobbingKey, Bound),
     PingPong(MobbingKey, Bound),
+    MonsterPark(MobbingKey, Bound),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -663,6 +664,191 @@ impl DefaultRotator {
         );
     }
 
+    fn rotate_monster_park(
+        &mut self,
+        resources: &Resources,
+        player_context: &mut PlayerContext,
+        minimap_state: Minimap,
+        key: MobbingKey,
+        bound: Bound,
+    ) {
+        // First check if player has a normal action, if so, let it complete
+        if player_context.has_normal_action() {
+            return;
+        }
+
+        // Check if player has a priority action for portal usage
+        if player_context.has_priority_action() {
+            return;
+        }
+
+        let Minimap::Idle(idle) = minimap_state else {
+            return;
+        };
+        let Some(pos) = player_context.last_known_pos else {
+            return;
+        };
+
+        let bound_rect = if player_context.config.auto_mob_platforms_bound {
+            idle.platforms_bound.unwrap_or(bound.into())
+        } else {
+            bound.into()
+        };
+
+        // Check for mobs first
+        let Update::Ok(mob_points) =
+            update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
+                detector.detect_mobs(idle.bbox, bound_rect, pos)
+            })
+        else {
+            return;
+        };
+
+        // Filter and process mob points similar to auto mobbing
+        let mob_points: Vec<Point> = mob_points
+            .iter()
+            .filter_map(|point| {
+                let y = idle.bbox.height - point.y;
+                let point = if y <= pos.y || (y - pos.y).abs() <= GRAPPLING_THRESHOLD {
+                    Some(Point::new(point.x, y))
+                } else {
+                    None
+                };
+                point.and_then(|point| {
+                    player_context.auto_mob_pick_reachable_y_position(
+                        resources,
+                        minimap_state,
+                        point,
+                    )
+                })
+            })
+            .collect();
+
+        // If mobs exist, use auto mobbing
+        if !mob_points.is_empty() {
+            // Reuse auto mobbing logic
+            let mut use_pathing_point = false;
+            
+            if let Some(last_quad) = player_context.auto_mob_last_quadrant() {
+                if self
+                    .auto_mob_quadrant_consecutive_count
+                    .is_none_or(|(quad, _)| quad != last_quad)
+                {
+                    self.auto_mob_quadrant_consecutive_count = Some((last_quad, 0));
+                }
+                let (_, count) = self
+                    .auto_mob_quadrant_consecutive_count
+                    .as_mut()
+                    .expect("is some");
+
+                *count += 1;
+                if *count >= AUTO_MOB_SAME_QUAD_THRESHOLD {
+                    *count = 0;
+                    use_pathing_point = true;
+                }
+            }
+
+            let mut is_pathing = use_pathing_point;
+            let point = if use_pathing_point {
+                player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
+            } else {
+                resources
+                    .rng
+                    .random_choose(mob_points.into_iter())
+                    .unwrap_or_else(|| {
+                        is_pathing = true;
+                        player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
+                    })
+            };
+            let key_hold_ticks = (key.key_hold_millis / MS_PER_TICK) as u32;
+            let wait_before_ticks = (key.wait_before_millis / MS_PER_TICK) as u32;
+            let wait_before_ticks_random_range =
+                (key.wait_before_millis_random_range / MS_PER_TICK) as u32;
+            let wait_after_ticks = (key.wait_after_millis / MS_PER_TICK) as u32;
+            let wait_after_ticks_random_range =
+                (key.wait_after_millis_random_range / MS_PER_TICK) as u32;
+            let position = Position {
+                x: point.x,
+                x_random_range: 0,
+                y: point.y,
+                allow_adjusting: false,
+            };
+
+            player_context.set_normal_action(
+                None,
+                PlayerAction::AutoMob(AutoMob {
+                    key: key.key.into(),
+                    key_hold_ticks,
+                    link_key: key.link_key.into(),
+                    count: key.count.max(1),
+                    with: key.with,
+                    wait_before_ticks,
+                    wait_before_ticks_random_range,
+                    wait_after_ticks,
+                    wait_after_ticks_random_range,
+                    position,
+                    is_pathing,
+                }),
+            );
+            return;
+        }
+
+        // No mobs found, check for portals
+        let portals = idle.portals();
+        let Some(portal) = portals.iter().next() else {
+            // No portal found, Monster Park is complete for this map
+            debug!(target: "rotator", "Monster Park: No mobs and no portal found, map complete");
+            return;
+        };
+
+        // Calculate portal center position
+        // Portal coordinates are already in bottom-left coordinate system
+        let portal_center_x = portal.x + portal.width / 2;
+        let portal_center_y = portal.y + portal.height / 2;
+        let portal_center = Point::new(portal_center_x, portal_center_y);
+
+        // Check if player is already at the portal
+        if idle.is_position_inside_portal(pos) {
+            // Player is at portal, press Up key to use it
+            let position = Position {
+                x: portal_center_x,
+                x_random_range: 0,
+                y: portal_center_y,
+                allow_adjusting: true,
+            };
+            let key = Key {
+                key: KeyKind::Up,
+                key_hold_ticks: 0,
+                key_hold_buffered_to_wait_after: false,
+                link_key: LinkKeyKind::None,
+                count: 1,
+                position: Some(position),
+                direction: ActionKeyDirection::Any,
+                with: ActionKeyWith::Stationary,
+                wait_before_use_ticks: 5,
+                wait_before_use_ticks_random_range: 0,
+                wait_after_use_ticks: 0,
+                wait_after_use_ticks_random_range: 0,
+                wait_after_buffered: WaitAfterBuffered::None,
+            };
+            player_context.set_priority_action(None, PlayerAction::Key(key));
+            debug!(target: "rotator", "Monster Park: Player at portal, pressing Up key");
+        } else {
+            // Player is not at portal, move towards it
+            let position = Position {
+                x: portal_center_x,
+                x_random_range: 0,
+                y: portal_center_y,
+                allow_adjusting: true,
+            };
+            player_context.set_normal_action(
+                None,
+                PlayerAction::Move(Move { position }),
+            );
+            debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
+        }
+    }
+
     fn rotate_ping_pong(
         &mut self,
         player_context: &mut PlayerContext,
@@ -1007,6 +1193,13 @@ impl Rotator for DefaultRotator {
             RotatorMode::PingPong(key, bound) => {
                 self.rotate_ping_pong(&mut world.player.context, world.minimap.state, key, bound)
             }
+            RotatorMode::MonsterPark(key, bound) => self.rotate_monster_park(
+                resources,
+                &mut world.player.context,
+                world.minimap.state,
+                key,
+                bound,
+            ),
         }
     }
 }

@@ -77,6 +77,7 @@ pub enum RotationMode {
     StartToEndThenReverse,
     AutoMobbing,
     PingPong,
+    MonsterPark,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]

@@ -100,6 +100,9 @@ fn rotator_mode_from(map: Option<&Map>) -> RotatorMode {
         RotationMode::PingPong => {
             RotatorMode::PingPong(map.rotation_mobbing_key, map.rotation_ping_pong_bound)
         }
+        RotationMode::MonsterPark => {
+            RotatorMode::MonsterPark(map.rotation_mobbing_key, map.rotation_auto_mob_bound)
+        }
     })
     .unwrap_or_default()
 }
@@ -286,6 +289,10 @@ mod tests {
                 (RotationMode::PingPong, RotatorMode::PingPong(key, bound)) => {
                     assert_eq!(*key, map.rotation_mobbing_key);
                     assert_eq!(*bound, map.rotation_ping_pong_bound);
+                }
+                (RotationMode::MonsterPark, RotatorMode::MonsterPark(key, bound)) => {
+                    assert_eq!(*key, map.rotation_mobbing_key);
+                    assert_eq!(*bound, map.rotation_auto_mob_bound);
                 }
                 _ => panic!("rotation mode mismatch"),
             }

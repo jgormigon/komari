@@ -482,6 +482,10 @@ fn Canvas(
                 "AutoMobbing",
             )),
             RotationMode::PingPong => Some((map.rotation_ping_pong_bound, "PingPong")),
+            RotationMode::MonsterPark => Some((
+                platforms_bound.unwrap_or(map.rotation_auto_mob_bound),
+                "MonsterPark",
+            )),
         }
     });
 

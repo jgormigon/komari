@@ -28,7 +28,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
 
     let update_mobbing_key_disabled = use_memo(move || {
         let mode = map().rotation_mode;
-        !matches!(mode, RotationMode::AutoMobbing | RotationMode::PingPong)
+        !matches!(mode, RotationMode::AutoMobbing | RotationMode::PingPong | RotationMode::MonsterPark)
     });
 
     let edit_mobbing_key = move |rotation_mobbing_key| {
@@ -43,7 +43,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
 
         match map.rotation_mode {
             RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => return,
-            RotationMode::AutoMobbing => {
+            RotationMode::AutoMobbing | RotationMode::MonsterPark => {
                 map.rotation_auto_mob_bound = bound;
             }
             RotationMode::PingPong => {
@@ -62,7 +62,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
             RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => {
                 unreachable!()
             }
-            RotationMode::AutoMobbing | RotationMode::PingPong => map.rotation_mobbing_key,
+            RotationMode::AutoMobbing | RotationMode::PingPong | RotationMode::MonsterPark => map.rotation_mobbing_key,
         };
         popup_content.set(PopupContent::Key(key));
     };
@@ -73,7 +73,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
             RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => {
                 unreachable!()
             }
-            RotationMode::AutoMobbing => map.rotation_auto_mob_bound,
+            RotationMode::AutoMobbing | RotationMode::MonsterPark => map.rotation_auto_mob_bound,
             RotationMode::PingPong => map.rotation_ping_pong_bound,
         };
         popup_content.set(PopupContent::Bound(bound));
