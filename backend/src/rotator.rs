@@ -843,7 +843,10 @@ impl DefaultRotator {
             };
             player_context.set_normal_action(
                 None,
-                PlayerAction::Move(Move { position }),
+                PlayerAction::Move(Move { 
+                    position,
+                    wait_after_move_ticks: 0,
+                }),
             );
             debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
         }
