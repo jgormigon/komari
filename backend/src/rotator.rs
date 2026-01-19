@@ -705,12 +705,13 @@ impl DefaultRotator {
         };
 
         // Filter and process mob points similar to auto mobbing
+        // Note: mob_points are already in bottom-left coordinate system from detect_minimap_mobs
         let mob_points: Vec<Point> = mob_points
             .iter()
             .filter_map(|point| {
-                let y = idle.bbox.height - point.y;
-                let point = if y <= pos.y || (y - pos.y).abs() <= GRAPPLING_THRESHOLD {
-                    Some(Point::new(point.x, y))
+                // Mob points are already in bottom-left coordinates, no need to convert
+                let point = if point.y <= pos.y || (point.y - pos.y).abs() <= GRAPPLING_THRESHOLD {
+                    Some(*point)
                 } else {
                     None
                 };
@@ -817,10 +818,11 @@ impl DefaultRotator {
 
         if is_at_portal {
             // Player is at portal, press Up key to use it
+            // Use player's current position to avoid jumping
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
-                y: portal_center_y,
+                y: pos.y, // Use current Y position to avoid jumping
                 allow_adjusting: true,
             };
             let key = Key {
