@@ -574,7 +574,7 @@ fn detect_minimap_mobs<T: MatTraitConst + ToInputArray>(
         &*TEMPLATE,
         no_array(),
         Point::default(),
-        50, // Max matches - adjust as needed
+        50,  // Max matches - adjust as needed
         0.7, // Threshold - adjust as needed
     )
     .into_iter()
