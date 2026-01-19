@@ -841,10 +841,20 @@ impl DefaultRotator {
             debug!(target: "rotator", "Monster Park: Player at portal, pressing Up key");
         } else {
             // Player is not at portal, move towards it
+            // If player is at correct X coordinate, use their current Y to avoid jumping
+            // The Y tolerance check above is for determining if we're "at portal" enough to press Up,
+            // but for movement, if we're horizontally aligned, we should use current Y to prevent jumping
+            let target_y = if x_range.contains(&pos.x) {
+                // Player is at correct X, use current Y to avoid jumping
+                pos.y
+            } else {
+                // Player needs to move horizontally, use portal bottom Y (where player stands)
+                portal.y
+            };
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
-                y: portal_center_y,
+                y: target_y,
                 allow_adjusting: true,
             };
             player_context.set_normal_action(
@@ -1136,7 +1146,7 @@ impl Rotator for DefaultRotator {
             }
         }
 
-        if enable_panic_mode {
+        if enable_panic_mode && !matches!(mode, RotatorMode::MonsterPark(_, _)) {
             self.priority_actions
                 .insert(next_action_id(), panic_priority_action());
         }

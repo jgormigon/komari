@@ -1,5 +1,6 @@
 use super::EventContext;
 use crate::{
+    models::RotationMode,
     OperationUpdate,
     ecs::WorldEvent,
     notification::NotificationKind,
@@ -58,6 +59,16 @@ impl EventHandler<WorldEvent> for WorldEventHandler {
             }
             WorldEvent::MinimapChanged => {
                 if context.resources.operation.halting() {
+                    return;
+                }
+
+                // Skip halt if in MonsterPark mode (portals change maps)
+                let is_monster_park = context
+                    .map_service
+                    .map()
+                    .map(|map| matches!(map.rotation_mode, RotationMode::MonsterPark))
+                    .unwrap_or(false);
+                if is_monster_park {
                     return;
                 }
 
