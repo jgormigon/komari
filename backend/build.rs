@@ -241,6 +241,11 @@ fn main() {
         "cargo:rustc-env=PORTAL_TEMPLATE={}",
         portal.to_str().unwrap()
     );
+    let mob = resources_dir.join("mob_ideal_ratio.png");
+    println!(
+        "cargo:rustc-env=MOB_TEMPLATE={}",
+        mob.to_str().unwrap()
+    );
     println!(
         "cargo:rustc-env=CHANGE_CHANNEL_MENU_TEMPLATE={}",
         change_channel_menu.to_str().unwrap()

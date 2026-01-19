@@ -557,101 +557,48 @@ impl Detector for DefaultDetector {
     }
 }
 
+fn detect_minimap_mobs<T: MatTraitConst + ToInputArray>(
+    minimap_bgr: T,
+    _bound: Rect,
+) -> Vec<Point> {
+    /// TODO: Support default ratio
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("MOB_TEMPLATE")), IMREAD_COLOR).unwrap()
+    });
+
+    // Detect red dots (mobs) on the minimap using template matching
+    // Note: Bound is ignored - all mobs are detected regardless of bounds
+    // This is necessary for Monster Park mode where all mobs must be cleared
+    detect_template_multiple(
+        &minimap_bgr,
+        &*TEMPLATE,
+        no_array(),
+        Point::default(),
+        50, // Max matches - adjust as needed
+        0.7, // Threshold - adjust as needed
+    )
+    .into_iter()
+    .filter_map(|result| result.ok())
+    .map(|(bbox, _)| {
+        // Convert bounding box center to Point
+        let x = bbox.x + bbox.width / 2;
+        let y = bbox.y + bbox.height / 2;
+        // Convert from top-left coordinate to bottom-left coordinate (like player position)
+        let minimap_height = minimap_bgr.size().expect("size available").height;
+        Point::new(x, minimap_height - y)
+    })
+    .collect::<Vec<_>>()
+}
+
 fn detect_mobs(
     bgr: &impl MatTraitConst,
     minimap: Rect,
     bound: Rect,
     player: Point,
 ) -> Result<Vec<Point>> {
-    static MOB_MODEL: LazyLock<Mutex<Session>> = LazyLock::new(|| {
-        Mutex::new(
-            build_session(include_bytes!(env!("MOB_MODEL")))
-                .expect("build mob detection session successfully"),
-        )
-    });
-
-    /// Approximates the mob coordinate on screen to mob coordinate on minimap.
-    ///
-    /// This function tries to approximate the delta (dx, dy) that the player needs to move
-    /// in relative to the minimap coordinate in order to reach the mob. Returns the mob
-    /// coordinate on the minimap by adding the delta to the player position.
-    ///
-    /// Note: It is not that accurate but that is that and this is this. Hey it seems better than
-    /// the previous alchemy.
-    #[inline]
-    fn to_minimap_coordinate(
-        mob_bbox: Rect,
-        minimap_bbox: Rect,
-        mobbing_bound: Rect,
-        player: Point,
-        mat_size: Size,
-    ) -> Option<Point> {
-        // These numbers are for scaling dx/dy on the screen to dx/dy on the minimap.
-        // They are approximated in 1280x720 resolution by going from one point to another point
-        // from the middle of the screen with both points visible on screen before traveling. Take
-        // the distance traveled on the minimap and divide it by half of the resolution
-        // (e.g. tralveled minimap x / 640). Whether it is correct or not, time will tell.
-        const X_SCALE: f32 = 0.059_375;
-        const Y_SCALE: f32 = 0.036_111;
-
-        // The main idea is to calculate the offset of the detected mob from the middle of screen
-        // and use that distance as dx/dy to move the player. This assumes the player will
-        // most of the time be near or very close to the middle of the screen. This is already
-        // not accurate in the sense that the camera will have a bit of lag before
-        // it is centered again on the player. And when the player is near edges of the map,
-        // this function is just plain wrong. For better accuracy, detecting where the player is
-        // on the screen and use that as the basis is required.
-        let x_screen_mid = mat_size.width / 2;
-        let x_mob_mid = mob_bbox.x + mob_bbox.width / 2;
-        let x_screen_delta = x_screen_mid - x_mob_mid;
-        let x_minimap_delta = (x_screen_delta as f32 * X_SCALE) as i32;
-
-        // For dy, if the whole mob bounding box is above the screen mid point, then the
-        // box top edge is used to increase the dy distance as to help the player move up. The same
-        // goes for moving down. If the bounding box overlaps with the screen mid point, the box
-        // mid point is used as to to help the player stay in place.
-        let y_screen_mid = mat_size.height / 2;
-        let y_mob = if mob_bbox.y + mob_bbox.height < y_screen_mid {
-            mob_bbox.y
-        } else if mob_bbox.y > y_screen_mid {
-            mob_bbox.y + mob_bbox.height
-        } else {
-            mob_bbox.y + mob_bbox.height / 2
-        };
-        let y_screen_delta = y_screen_mid - y_mob;
-        let y_minimap_delta = (y_screen_delta as f32 * Y_SCALE) as i32;
-
-        let point_x = if x_minimap_delta > 0 {
-            (player.x - x_minimap_delta).max(0)
-        } else {
-            (player.x - x_minimap_delta).min(minimap_bbox.width)
-        };
-        let point_y = (player.y + y_minimap_delta).max(0).min(minimap_bbox.height);
-        // Minus the y by minimap height to make it relative to the minimap top edge
-        let point = Point::new(point_x, minimap_bbox.height - point_y);
-        if point.x < mobbing_bound.x
-            || point.x > mobbing_bound.x + mobbing_bound.width
-            || point.y < mobbing_bound.y
-            || point.y > mobbing_bound.y + mobbing_bound.height
-        {
-            None
-        } else {
-            Some(point)
-        }
-    }
-
-    let size = bgr.size().unwrap();
-    let (mat_in, w_ratio, h_ratio, left, top) = preprocess_for_yolo(bgr);
-    let mut model = MOB_MODEL.lock().unwrap();
-    let result = model.run([to_input_value(&mat_in)]).unwrap();
-    let result = from_output_value(&result);
-    // SAFETY: 0..result.rows() is within Mat bounds
-    let points = (0..result.rows())
-        .map(|i| unsafe { result.at_row_unchecked::<f32>(i).unwrap() })
-        .filter(|pred| pred[4] >= 0.5)
-        .map(|pred| remap_from_yolo(pred, size, w_ratio, h_ratio, left, top))
-        .filter_map(|bbox| to_minimap_coordinate(bbox, minimap, bound, player, size))
-        .collect::<Vec<_>>();
+    // Use template matching on minimap instead of YOLO
+    let minimap_bgr = bgr.roi(minimap)?;
+    let points = detect_minimap_mobs(minimap_bgr, bound);
     Ok(points)
 }
 
