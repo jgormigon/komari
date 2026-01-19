@@ -171,6 +171,9 @@ pub trait Detector: Debug + Send + Sync {
     /// Returns `Rect` relative to `minimap` coordinate.
     fn detect_minimap_portals(&self, minimap: Rect) -> Vec<Rect>;
 
+    /// Detects spiegelmann NPC on the screen.
+    fn detect_spiegelmann(&self) -> bool;
+
     /// Detects the rune from the given `minimap` rectangle.
     ///
     /// Returns `Rect` relative to `minimap` coordinate.
@@ -1110,6 +1113,15 @@ fn detect_minimap_portals<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Ve
         )
     })
     .collect::<Vec<_>>()
+}
+
+fn detect_spiegelmann(bgr: &impl ToInputArray) -> bool {
+    /// TODO: Support default ratio
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("SPIEGELMANN_TEMPLATE")), IMREAD_COLOR).unwrap()
+    });
+
+    detect_template(bgr, &*TEMPLATE, Point::default(), 0.7).is_ok()
 }
 
 fn detect_minimap_rune(minimap_bgr: &impl ToInputArray) -> Result<Rect> {

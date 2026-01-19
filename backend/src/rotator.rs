@@ -216,6 +216,10 @@ pub struct DefaultRotator {
     /// These are actions injected externally and to be executed as appropriate with the current
     /// [`Self::priority_actions_queue`]. These actions are run only once and do not have an ID.
     priority_actions_side_queue: VecDeque<RotatorAction>,
+
+    /// Last detected portal position for Monster Park mode.
+    /// Used to detect map changes when portal disappears or changes position.
+    monster_park_last_portal: Option<Point>,
 }
 
 impl DefaultRotator {
@@ -682,6 +686,31 @@ impl DefaultRotator {
             return;
         }
 
+        // Check for spiegelmann (end stage NPC) - press interact key and stop bot
+        if resources.detector().detect_spiegelmann() {
+            let interact_key = Key {
+                key: player_context.config.interact_key, // Use user-defined interact key from Characters.Interact
+                key_hold_ticks: 0,
+                key_hold_buffered_to_wait_after: false,
+                link_key: LinkKeyKind::None,
+                count: 1,
+                position: None,
+                direction: ActionKeyDirection::Any,
+                with: ActionKeyWith::Stationary,
+                wait_before_use_ticks: 0,
+                wait_before_use_ticks_random_range: 0,
+                wait_after_use_ticks: 0,
+                wait_after_use_ticks_random_range: 0,
+                wait_after_buffered: WaitAfterBuffered::None,
+            };
+            player_context.set_priority_action(None, PlayerAction::Key(interact_key));
+            // Stop the bot after interacting with spiegelmann by injecting a panic to town action
+            // This will effectively halt the bot
+            self.inject_action(PlayerAction::Panic(Panic { to: PanicTo::Town }));
+            debug!(target: "rotator", "Monster Park: Detected spiegelmann, pressing interact key and stopping bot");
+            return;
+        }
+
         let Minimap::Idle(idle) = minimap_state else {
             return;
         };
@@ -753,9 +782,15 @@ impl DefaultRotator {
             let point = if use_pathing_point {
                 player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
             } else {
-                resources
-                    .rng
-                    .random_choose(mob_points.into_iter())
+                // Select the closest mob to the player
+                mob_points
+                    .iter()
+                    .min_by_key(|mob_point| {
+                        let dx = mob_point.x - pos.x;
+                        let dy = mob_point.y - pos.y;
+                        dx * dx + dy * dy // Distance squared (avoid sqrt for performance)
+                    })
+                    .copied()
                     .unwrap_or_else(|| {
                         is_pathing = true;
                         player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
@@ -797,6 +832,12 @@ impl DefaultRotator {
         // No mobs found, check for portals
         let portals = idle.portals();
         let Some(portal) = portals.iter().next() else {
+            // No portal found - check if we had a portal before (map changed)
+            if self.monster_park_last_portal.is_some() {
+                // Map changed, clear portal tracking
+                self.monster_park_last_portal = None;
+                debug!(target: "rotator", "Monster Park: Map changed, cleared portal tracking");
+            }
             // No portal found, Monster Park is complete for this map
             debug!(target: "rotator", "Monster Park: No mobs and no portal found, map complete");
             return;
@@ -807,6 +848,20 @@ impl DefaultRotator {
         let portal_center_x = portal.x + portal.width / 2;
         let portal_center_y = portal.y + portal.height / 2;
         let portal_center = Point::new(portal_center_x, portal_center_y);
+
+        // Detect map change: if portal position changed significantly, we're on a new map
+        if let Some(last_portal) = self.monster_park_last_portal {
+            let dx = portal_center.x - last_portal.x;
+            let dy = portal_center.y - last_portal.y;
+            let distance_sq = dx * dx + dy * dy;
+            // If portal moved more than 100 pixels, assume map changed
+            if distance_sq > 10000 {
+                self.monster_park_last_portal = None;
+                debug!(target: "rotator", "Monster Park: Map changed (portal moved significantly), cleared portal tracking");
+                return;
+            }
+        }
+        self.monster_park_last_portal = Some(portal_center);
 
         // Check if player is already at the portal
         // Allow a small Y tolerance (6 pixels) since small height differences are acceptable
@@ -843,10 +898,8 @@ impl DefaultRotator {
             player_context.set_priority_action(None, PlayerAction::Key(key));
             debug!(target: "rotator", "Monster Park: Player at portal, pressing Up key");
         } else {
-            // Player is not at portal, move towards it
-            // If player is at correct X coordinate, use their current Y to avoid jumping
-            // The Y tolerance check above is for determining if we're "at portal" enough to press Up,
-            // but for movement, if we're horizontally aligned, we should use current Y to prevent jumping
+            // Player is not at portal, move towards it while attacking
+            // Use AutoMob instead of Move to attack with mobbing key during movement
             let target_y = if x_range.contains(&pos.x) {
                 // Player is at correct X, use current Y to avoid jumping
                 pos.y
@@ -858,16 +911,32 @@ impl DefaultRotator {
                 x: portal_center_x,
                 x_random_range: 0,
                 y: target_y,
-                allow_adjusting: true,
+                allow_adjusting: false, // Don't allow adjusting when moving to portal
             };
+            let key_hold_ticks = (key.key_hold_millis / MS_PER_TICK) as u32;
+            let wait_before_ticks = (key.wait_before_millis / MS_PER_TICK) as u32;
+            let wait_before_ticks_random_range =
+                (key.wait_before_millis_random_range / MS_PER_TICK) as u32;
+            let wait_after_ticks = (key.wait_after_millis / MS_PER_TICK) as u32;
+            let wait_after_ticks_random_range =
+                (key.wait_after_millis_random_range / MS_PER_TICK) as u32;
             player_context.set_normal_action(
                 None,
-                PlayerAction::Move(Move {
+                PlayerAction::AutoMob(AutoMob {
+                    key: key.key.into(),
+                    key_hold_ticks,
+                    link_key: key.link_key.into(),
+                    count: key.count.max(1),
+                    with: key.with,
+                    wait_before_ticks,
+                    wait_before_ticks_random_range,
+                    wait_after_ticks,
+                    wait_after_ticks_random_range,
                     position,
-                    wait_after_move_ticks: 0,
+                    is_pathing: false,
                 }),
             );
-            debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
+            debug!(target: "rotator", "Monster Park: Moving to portal at {:?} while attacking", portal_center);
         }
     }
 
@@ -1180,6 +1249,7 @@ impl Rotator for DefaultRotator {
         self.priority_queuing_linked_action = None;
         self.auto_mob_task = None;
         self.auto_mob_quadrant_consecutive_count = None;
+        self.monster_park_last_portal = None;
     }
 
     #[inline]
