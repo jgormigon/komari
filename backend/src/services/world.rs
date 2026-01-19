@@ -1,8 +1,8 @@
 use super::EventContext;
 use crate::{
-    models::RotationMode,
     OperationUpdate,
     ecs::WorldEvent,
+    models::RotationMode,
     notification::NotificationKind,
     player::{PanicTo, Panicking, Player},
     services::{EventHandler, operation::Halt},

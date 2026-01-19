@@ -811,7 +811,8 @@ impl DefaultRotator {
         // Allow a small Y tolerance (6 pixels) since small height differences are acceptable
         const PORTAL_Y_TOLERANCE: i32 = 8;
         let x_range = portal.x..(portal.x + portal.width);
-        let y_range = (portal.y - PORTAL_Y_TOLERANCE)..(portal.y + portal.height + PORTAL_Y_TOLERANCE);
+        let y_range =
+            (portal.y - PORTAL_Y_TOLERANCE)..(portal.y + portal.height + PORTAL_Y_TOLERANCE);
         let is_at_portal = x_range.contains(&pos.x) && y_range.contains(&pos.y);
 
         if is_at_portal {
