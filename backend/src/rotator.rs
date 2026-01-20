@@ -30,8 +30,8 @@ use crate::{
         WaitAfterBuffered,
     },
     player::{
-        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Panic,
-        PanicTo, PingPong, PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant,
+        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Panic, PanicTo,
+        PingPong, PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant,
         UseBooster,
     },
     run::MS_PER_TICK,
