@@ -132,7 +132,7 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects a list of mobs.
     ///
     /// Returns a list of mobs coordinate relative to minimap coordinate.
-    fn detect_mobs(&self, minimap: Rect, bound: Rect, player: Point) -> Result<Vec<Point>>;
+    fn detect_mobs(&self, minimap: Rect, bound: Rect, _player: Point) -> Result<Vec<Point>>;
 
     /// Detects whether to press ESC for unstucking.
     fn detect_esc_settings(&self) -> bool;
@@ -341,8 +341,8 @@ impl Detector for DefaultDetector {
         &self.grayscale
     }
 
-    fn detect_mobs(&self, minimap: Rect, bound: Rect, player: Point) -> Result<Vec<Point>> {
-        detect_mobs(self.bgr(), minimap, bound, player)
+    fn detect_mobs(&self, minimap: Rect, bound: Rect, _player: Point) -> Result<Vec<Point>> {
+        detect_mobs(self.bgr(), minimap, bound, _player)
     }
 
     fn detect_esc_settings(&self) -> bool {
@@ -558,6 +558,10 @@ impl Detector for DefaultDetector {
     fn detect_transparent_shapes(&self, region: Rect) -> Vec<Rect> {
         detect_transparent_shapes(&self.bgr().roi(region).unwrap())
     }
+
+    fn detect_spiegelmann(&self) -> bool {
+        detect_spiegelmann(self.bgr())
+    }
 }
 
 fn detect_minimap_mobs<T: MatTraitConst + ToInputArray>(
@@ -597,7 +601,7 @@ fn detect_mobs(
     bgr: &impl MatTraitConst,
     minimap: Rect,
     bound: Rect,
-    player: Point,
+    _player: Point,
 ) -> Result<Vec<Point>> {
     // Use template matching on minimap instead of YOLO
     let minimap_bgr = bgr.roi(minimap)?;

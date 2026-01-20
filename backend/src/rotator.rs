@@ -30,7 +30,7 @@ use crate::{
         WaitAfterBuffered,
     },
     player::{
-        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Move, Panic,
+        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Panic,
         PanicTo, PingPong, PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant,
         UseBooster,
     },
