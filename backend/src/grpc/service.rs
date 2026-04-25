@@ -11,7 +11,7 @@ use tokio::{
     task::{JoinHandle, block_in_place},
 };
 use tonic::{
-    Request, Status,
+    Code, Request, Status,
     transport::{Channel, Endpoint},
 };
 
@@ -79,6 +79,10 @@ impl InputService {
         state
     }
 
+    pub fn is_all_keys_cleared(&self) -> bool {
+        !self.key_down.any()
+    }
+
     pub fn send_mouse(&mut self, width: i32, height: i32, x: i32, y: i32, action: MouseAction) {
         self.with_client(|client| {
             block_future(async {
@@ -108,7 +112,6 @@ impl InputService {
             })?;
             Ok(())
         });
-
         self.key_down.set(i32::from(key) as usize, false);
     }
 
@@ -166,8 +169,10 @@ impl InputService {
         };
 
         if let Err(status) = f(client) {
-            info!(target: "rpc", "rpc call failed: {status}");
-            self.state = State::Disconnected;
+            info!(target: "backend/rpc", "rpc call failed: {status}");
+            if status.code() == Code::Unavailable {
+                self.state = State::Disconnected;
+            }
         }
     }
 
@@ -193,7 +198,7 @@ impl InputService {
 
         let endpoint = self.endpoint.clone();
         let seed = self.seed.clone();
-        info!(target: "rpc", "connecting to input server {}", endpoint.uri());
+        info!(target: "backend/rpc", "connecting to input server {}", endpoint.uri());
 
         let task = spawn(async move {
             let mut client = KeyInputClient::connect(endpoint).await.ok()?;

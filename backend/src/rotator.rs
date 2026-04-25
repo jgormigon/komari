@@ -156,6 +156,7 @@ pub struct RotatorBuildArgs {
     pub enable_panic_mode: bool,
     pub enable_rune_solving: bool,
     pub enable_transparent_shape_solving: bool,
+    pub enable_violetta_solving: bool,
     pub enable_reset_normal_actions_on_erda: bool,
     pub enable_using_generic_booster: bool,
     pub enable_using_hexa_booster: bool,
@@ -183,7 +184,7 @@ pub trait Rotator: Debug + 'static {
     ///
     /// If [`Operation`] is currently halting, it does not rotate the built actions but only the
     /// side-loaded actions added by [`Self::inject_action`].
-    fn rotate_action(&mut self, resources: &Resources, world: &mut World);
+    fn rotate_action(&mut self, resources: &mut Resources, world: &mut World);
 }
 
 #[derive(Default, Debug)]
@@ -229,7 +230,7 @@ impl DefaultRotator {
     ///
     /// This function does not pass the action to the player but only pushes the action to
     /// [`Self::priority_actions_queue`]. It is responsible for checking queuing condition.
-    fn rotate_priority_actions(&mut self, resources: &Resources, world: &mut World) {
+    fn rotate_priority_actions(&mut self, resources: &mut Resources, world: &mut World) {
         #[derive(Debug)]
         enum ResolveConflict {
             None,
@@ -307,14 +308,14 @@ impl DefaultRotator {
                         .and_then(|action| action.metadata)
                         .is_some_and(|metadata| matches!(metadata, ActionMetadata::UseBooster))
                     {
-                        info!(target: "rotator", "ignored booster usage due to conflict with another booster kind");
+                        info!(target: "backend/rotator", "ignored booster usage due to conflict with another booster kind");
                         return ResolveConflict::Ignore;
                     }
 
                     for id in rotator.priority_actions_queue.iter() {
                         let action = rotator.priority_actions.get(id).expect("exists");
                         if matches!(action.metadata, Some(ActionMetadata::UseBooster)) {
-                            info!(target: "rotator", "ignored booster usage due to conflict with another booster kind");
+                            info!(target: "backend/rotator", "ignored booster usage due to conflict with another booster kind");
                             return ResolveConflict::Ignore;
                         }
                     }
@@ -548,7 +549,7 @@ impl DefaultRotator {
 
     fn rotate_auto_mobbing(
         &mut self,
-        resources: &Resources,
+        resources: &mut Resources,
         player_context: &mut PlayerContext,
         minimap_state: Minimap,
         key: MobbingKey,
@@ -564,20 +565,16 @@ impl DefaultRotator {
         let Some(pos) = player_context.last_known_pos else {
             return;
         };
-        let bound = if player_context.config.auto_mob_platforms_bound {
-            idle.platforms_bound.unwrap_or(bound.into())
-        } else {
-            bound.into()
-        };
+        let bound = bound.into();
 
+        let name = player_context.name();
         let Update::Ok(points) =
             update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
-                detector.detect_mobs(idle.bbox, bound, pos)
+                detector.detect_mobs(idle.bbox, bound, pos, name)
             })
         else {
             return;
         };
-        // FIXME: Collect to a Vec first because `context.rng` needs to be borrowed again.
         let points = points
             .iter()
             .filter_map(|point| {
@@ -587,7 +584,7 @@ impl DefaultRotator {
                 } else {
                     None
                 };
-                debug!(target: "rotator", "auto mob raw position {point:?}");
+                debug!(target: "backend/rotator", "auto mob raw position {point:?}");
                 point.and_then(|point| {
                     player_context.auto_mob_pick_reachable_y_position(
                         resources,
@@ -1003,7 +1000,7 @@ impl DefaultRotator {
 impl Rotator for DefaultRotator {
     #[cfg_attr(test, concretize)]
     fn build_actions(&mut self, args: RotatorBuildArgs) {
-        info!(target: "rotator", "preparing actions {args:?}");
+        info!(target: "backend/rotator", "preparing actions {args:?}");
         let RotatorBuildArgs {
             mode,
             character_actions,
@@ -1019,6 +1016,7 @@ impl Rotator for DefaultRotator {
             enable_panic_mode,
             enable_rune_solving,
             enable_transparent_shape_solving,
+            enable_violetta_solving,
             enable_reset_normal_actions_on_erda,
             enable_using_generic_booster,
             enable_using_hexa_booster,
@@ -1110,6 +1108,10 @@ impl Rotator for DefaultRotator {
             self.priority_actions
                 .insert(next_action_id(), solve_transparent_shape_priority_action());
         }
+        if enable_violetta_solving {
+            self.priority_actions
+                .insert(next_action_id(), solve_violetta_priority_action());
+        }
 
         match elite_boss_behavior {
             EliteBossBehavior::None => (),
@@ -1167,7 +1169,7 @@ impl Rotator for DefaultRotator {
     }
 
     #[inline]
-    fn rotate_action(&mut self, resources: &Resources, world: &mut World) {
+    fn rotate_action(&mut self, resources: &mut Resources, world: &mut World) {
         if resources.operation.halting() {
             if !has_side_loaded_action_executing(&world.player.context) {
                 self.rotate_side_priority_action(&mut world.player.context);
@@ -1415,7 +1417,7 @@ fn solve_rune_priority_action() -> PriorityAction {
 fn solve_transparent_shape_priority_action() -> PriorityAction {
     let mut task: Option<Task<Result<bool>>> = None;
     let task_fn = move |detector: Arc<dyn Detector>| -> Result<bool> {
-        Ok(detector.detect_lie_detector().is_ok())
+        Ok(detector.detect_lie_detector_shape().is_ok())
     };
 
     PriorityAction {
@@ -1433,6 +1435,33 @@ fn solve_transparent_shape_priority_action() -> PriorityAction {
         condition_kind: None,
         metadata: None,
         inner: RotatorAction::Single(PlayerAction::SolveShape),
+        queue_to_front: true,
+        queue_info: PriorityActionQueueInfo::default(),
+    }
+}
+
+#[inline]
+fn solve_violetta_priority_action() -> PriorityAction {
+    let mut task: Option<Task<Result<bool>>> = None;
+    let task_fn = move |detector: Arc<dyn Detector>| -> Result<bool> {
+        Ok(detector.detect_lie_detector_violetta().is_ok())
+    };
+
+    PriorityAction {
+        condition: Condition(Box::new(move |resources, _, _| {
+            if resources.detector.is_none() {
+                return ConditionResult::Ignore;
+            }
+
+            match update_detection_task(resources, 3000, &mut task, task_fn) {
+                Update::Ok(true) => ConditionResult::Queue,
+                Update::Err(_) | Update::Ok(false) => ConditionResult::Ignore,
+                Update::Pending => ConditionResult::Skip,
+            }
+        })),
+        condition_kind: None,
+        metadata: None,
+        inner: RotatorAction::Single(PlayerAction::SolveVioletta),
         queue_to_front: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
@@ -1489,6 +1518,9 @@ fn buff_priority_action(buff: BuffKind, key: KeyKind) -> PriorityAction {
                 }
                 BuffKind::ExpCouponX4 => {
                     skip_if_has_buff!(world, ExpCouponX3 | ExpCouponX2)
+                }
+                BuffKind::BonusExpCoupon => {
+                    skip_if_has_buff!(world, MvpBonusExpCoupon)
                 }
                 _ => (),
             }
@@ -1934,13 +1966,14 @@ mod tests {
             enable_panic_mode: true,
             enable_rune_solving: true,
             enable_transparent_shape_solving: true,
+            enable_violetta_solving: true,
             enable_reset_normal_actions_on_erda: false,
             enable_using_generic_booster: false,
             enable_using_hexa_booster: false,
         };
 
         rotator.build_actions(args);
-        assert_eq!(rotator.priority_actions.len(), 10);
+        assert_eq!(rotator.priority_actions.len(), 11);
         assert_eq!(rotator.normal_actions.len(), 2);
     }
 
@@ -1948,7 +1981,7 @@ mod tests {
     fn rotator_rotate_action_start_to_end_then_reverse() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
         rotator.normal_rotate_mode = RotatorMode::StartToEndThenReverse;
         for i in 0..3 {
             rotator
@@ -1956,31 +1989,31 @@ mod tests {
                 .push((i, RotatorAction::Single(NORMAL_ACTION.into())));
         }
 
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(world.player.context.normal_action_id(), Some(0));
         assert!(!rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 1);
 
         world.player.context.clear_actions_aborted(true);
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(world.player.context.normal_action_id(), Some(1));
         assert!(!rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 2);
 
         world.player.context.clear_actions_aborted(true);
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(world.player.context.normal_action_id(), Some(2));
         assert!(rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 1);
 
         world.player.context.clear_actions_aborted(true);
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(world.player.context.normal_action_id(), Some(1));
         assert!(rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 2);
 
         world.player.context.clear_actions_aborted(true);
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(world.player.context.normal_action_id(), Some(0));
         assert!(!rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 1);
@@ -1990,7 +2023,7 @@ mod tests {
     fn rotator_rotate_action_start_to_end() {
         let mut world = mock_world();
         let mut rotator = DefaultRotator::default();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
         rotator.normal_rotate_mode = RotatorMode::StartToEnd;
         for i in 0..2 {
             rotator
@@ -1998,14 +2031,14 @@ mod tests {
                 .push((i, RotatorAction::Single(NORMAL_ACTION.into())));
         }
 
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert!(world.player.context.has_normal_action());
         assert!(!rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 1);
 
         world.player.context.clear_actions_aborted(true);
 
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert!(world.player.context.has_normal_action());
         assert!(!rotator.normal_actions_backward);
         assert_eq!(rotator.normal_index, 0);
@@ -2036,9 +2069,9 @@ mod tests {
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
 
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(rotator.priority_actions_queue.len(), 0);
         assert_eq!(world.player.context.priority_action_id(), Some(55));
     }
@@ -2047,7 +2080,7 @@ mod tests {
     fn rotator_priority_actions_queue_to_front() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
         // queue 2 non-front priority actions
         rotator.priority_actions.insert(
             2,
@@ -2072,7 +2105,7 @@ mod tests {
             },
         );
 
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(rotator.priority_actions_queue.len(), 1);
         assert_eq!(world.player.context.priority_action_id(), Some(2));
 
@@ -2090,7 +2123,7 @@ mod tests {
         );
 
         // non-front priority action get replaced
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(
             rotator.priority_actions_queue,
             VecDeque::from_iter([2, 3].into_iter())
@@ -2112,7 +2145,7 @@ mod tests {
 
         // queued front priority action cannot be replaced
         // by another front priority action
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(
             rotator.priority_actions_queue,
             VecDeque::from_iter([5, 2, 3].into_iter())
@@ -2124,7 +2157,7 @@ mod tests {
     fn rotator_priority_linked_action() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
         rotator.priority_actions.insert(
             2,
             PriorityAction {
@@ -2144,7 +2177,7 @@ mod tests {
         );
 
         // linked action queued
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert!(rotator.priority_actions_queue.is_empty());
         assert!(rotator.priority_queuing_linked_action.is_some());
         assert_eq!(world.player.context.priority_action_id(), Some(2));
@@ -2161,14 +2194,14 @@ mod tests {
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert_eq!(
             rotator.priority_actions_queue,
             VecDeque::from_iter([4].into_iter())
         );
 
         world.player.context.clear_actions_aborted(true);
-        rotator.rotate_action(&resources, &mut world);
+        rotator.rotate_action(&mut resources, &mut world);
         assert!(rotator.priority_queuing_linked_action.is_none());
         assert_eq!(
             rotator.priority_actions_queue,
@@ -2224,7 +2257,7 @@ mod tests {
     fn rotator_priority_action_is_ignored_when_executing() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
 
         // Insert a priority action with condition_kind = None
         let action_id = 99;
@@ -2246,7 +2279,7 @@ mod tests {
             .set_priority_action(Some(action_id), NORMAL_ACTION.into());
 
         // Call rotate_priority_actions
-        rotator.rotate_priority_actions(&resources, &mut world);
+        rotator.rotate_priority_actions(&mut resources, &mut world);
 
         let action = rotator.priority_actions.get(&action_id).unwrap();
 
@@ -2262,7 +2295,7 @@ mod tests {
     fn rotator_priority_linked_action_is_ignored_when_executing() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
 
         let action_id = 42;
         rotator.priority_actions.insert(
@@ -2286,7 +2319,7 @@ mod tests {
             .context
             .set_priority_action(Some(action_id), NORMAL_ACTION.into());
 
-        rotator.rotate_priority_actions(&resources, &mut world);
+        rotator.rotate_priority_actions(&mut resources, &mut world);
 
         let action = rotator.priority_actions.get(&action_id).unwrap();
 
@@ -2299,7 +2332,7 @@ mod tests {
     fn rotator_erda_shower_action_ignored_if_another_erda_is_queued() {
         let mut rotator = DefaultRotator::default();
         let mut world = mock_world();
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
 
         let first_erda_id = 1;
         let second_erda_id = 2;
@@ -2335,7 +2368,7 @@ mod tests {
         rotator.priority_actions_queue.push_back(first_erda_id);
 
         // Run rotate
-        rotator.rotate_priority_actions(&resources, &mut world);
+        rotator.rotate_priority_actions(&mut resources, &mut world);
 
         let second_erda = rotator.priority_actions.get(&second_erda_id).unwrap();
 
@@ -2369,7 +2402,7 @@ mod tests {
 
     #[tokio::test]
     async fn unstuck_priority_action_triggers_when_esc_settings_detected() {
-        let resources = Resources::new(
+        let mut resources = Resources::new(
             None,
             Some(mock_detector(|detector| {
                 detector.expect_detect_esc_settings().returning(|| true);
@@ -2380,7 +2413,7 @@ mod tests {
         let info = PriorityActionQueueInfo::default();
         let mut action = unstuck_priority_action();
 
-        queue_or_timeout(|| (action.condition.0)(&resources, &world, &info)).await;
+        queue_or_timeout(|| (action.condition.0)(&mut resources, &world, &info)).await;
     }
 
     #[tokio::test]
@@ -2388,18 +2421,18 @@ mod tests {
         let detector = mock_detector(|detector| {
             detector.expect_detect_elite_boss_bar().return_const(true);
         });
-        let resources = Resources::new(None, Some(detector));
+        let mut resources = Resources::new(None, Some(detector));
         let world = mock_world();
 
         let mut action = elite_boss_use_key_priority_action(KeyKind::A);
         let info = PriorityActionQueueInfo::default();
 
-        queue_or_timeout(|| (action.condition.0)(&resources, &world, &info)).await;
+        queue_or_timeout(|| (action.condition.0)(&mut resources, &world, &info)).await;
     }
 
     #[tokio::test]
     async fn panic_priority_action_triggers_when_has_other_players() {
-        let resources = Resources::new(None, None);
+        let mut resources = Resources::new(None, None);
         let mut idle = MinimapIdle::default();
         idle.set_has_any_other_player(true);
         let mut world = mock_world();
@@ -2411,7 +2444,7 @@ mod tests {
             ..Default::default()
         };
 
-        queue_or_timeout(|| (action.condition.0)(&resources, &world, &info)).await;
+        queue_or_timeout(|| (action.condition.0)(&mut resources, &world, &info)).await;
     }
 
     // TODO: more tests

@@ -1,9 +1,9 @@
 use std::{fmt::Display, mem};
 
 use backend::{
-    CaptureMode, CycleRunStopMode, InputMethod, IntoEnumIterator, KeyBinding,
-    KeyBindingConfiguration, Notifications, Settings, query_capture_handles, query_settings,
-    refresh_capture_handles, select_capture_handle, upsert_settings,
+    CaptureMode, InputMethod, IntoEnumIterator, KeyBinding, KeyBindingConfiguration, Notifications,
+    Settings, WebhookProvider, query_capture_handles, query_settings, refresh_capture_handles,
+    select_capture_handle, upsert_settings,
 };
 use dioxus::{html::FileData, prelude::*};
 use futures_util::StreamExt;
@@ -13,6 +13,7 @@ use crate::{
     components::{
         button::{Button, ButtonStyle},
         checkbox::Checkbox,
+        duration::DurationInput,
         file::{FileInput, FileOutput},
         icons::{EyePasswordHideIcon, EyePasswordShowIcon},
         key::KeyInput,
@@ -72,9 +73,9 @@ pub fn SettingsScreen() -> Element {
         div { class: "flex flex-col h-full overflow-y-auto",
             SectionCapture {}
             SectionInput {}
-            SectionControlAndNotifications {}
+            SectionNotifications {}
             SectionHotkeys {}
-            SectionRunStopCycle {}
+            SectionRunTimer {}
             SectionOthers {}
         }
     }
@@ -177,45 +178,48 @@ fn SectionInput() -> Element {
 }
 
 #[component]
-fn SectionControlAndNotifications() -> Element {
+fn SectionNotifications() -> Element {
     let context = use_context::<SettingsContext>();
     let settings = context.settings;
     let save_settings = context.save_settings;
     let notifications = use_memo(move || settings().notifications);
 
     rsx! {
-        Section { title: "Control and notifications",
+        Section { title: "Notifications",
             div { class: "grid grid-cols-2 gap-3 mb-2",
-                SettingsTextInput {
-                    text_label: "Discord bot access token",
-                    button_label: "Update",
-                    sensitive: true,
-                    on_value: move |discord_bot_access_token| {
-                        save_settings(Settings {
-                            discord_bot_access_token,
-                            ..settings.peek().clone()
-                        });
-                    },
-                    value: settings().discord_bot_access_token,
-                }
-                SettingsTextInput {
-                    text_label: "Discord webhook URL",
-                    button_label: "Update",
-                    sensitive: true,
-                    on_value: move |discord_webhook_url| {
+                SettingsEnumSelect::<WebhookProvider> {
+                    label: "Webhook provider",
+                    on_selected: move |webhook_provider| {
                         save_settings(Settings {
                             notifications: Notifications {
-                                discord_webhook_url,
+                                webhook_provider,
                                 ..notifications.peek().clone()
                             },
                             ..settings.peek().clone()
                         });
                     },
-                    value: notifications().discord_webhook_url,
+                    selected: settings().notifications.webhook_provider,
+                }
+                div {}
+                SettingsTextInput {
+                    text_label: "Webhook URL",
+                    button_label: "Update",
+                    sensitive: true,
+                    on_value: move |webhook_url| {
+                        save_settings(Settings {
+                            notifications: Notifications {
+                                webhook_url,
+                                ..notifications.peek().clone()
+                            },
+                            ..settings.peek().clone()
+                        });
+                    },
+                    value: notifications().webhook_url,
                 }
                 SettingsTextInput {
                     text_label: "Discord ping user ID",
                     button_label: "Update",
+                    sensitive: true,
                     on_value: move |discord_user_id| {
                         save_settings(Settings {
                             notifications: Notifications {
@@ -334,17 +338,17 @@ fn SectionControlAndNotifications() -> Element {
                     checked: notifications().notify_on_lie_detector_appear,
                 }
                 SettingsCheckbox {
-                    label: "Run/stop cycles",
-                    on_checked: move |notify_on_cycle_run_stop| {
+                    label: "Run timer ends",
+                    on_checked: move |notify_on_run_timer_end| {
                         save_settings(Settings {
                             notifications: Notifications {
-                                notify_on_cycle_run_stop,
+                                notify_on_run_timer_end,
                                 ..notifications.peek().clone()
                             },
                             ..settings.peek().clone()
                         });
                     },
-                    checked: notifications().notify_on_cycle_run_stop,
+                    checked: notifications().notify_on_run_timer_end,
                 }
             }
         }
@@ -439,43 +443,34 @@ fn SectionHotkeys() -> Element {
 }
 
 #[component]
-fn SectionRunStopCycle() -> Element {
+fn SectionRunTimer() -> Element {
     let context = use_context::<SettingsContext>();
     let settings = context.settings;
     let save_settings = context.save_settings;
 
     rsx! {
-        Section { title: "Run/stop cycle",
-            div { class: "grid grid-cols-3 gap-3",
-                SettingsMillisInput {
-                    label: "Run duration",
-                    on_value: move |cycle_run_duration_millis| {
-                        save_settings(Settings {
-                            cycle_run_duration_millis,
-                            ..settings.peek().clone()
-                        });
-                    },
-                    value: settings().cycle_run_duration_millis,
+        Section { title: "Run timer",
+            div { class: "grid grid-cols-2 gap-3",
+                Labeled { label: "Duration (hh:mm:ss)",
+                    DurationInput {
+                        on_value: move |run_timer_millis| {
+                            save_settings(Settings {
+                                run_timer_millis,
+                                ..settings.peek().clone()
+                            });
+                        },
+                        value: settings().run_timer_millis,
+                    }
                 }
-                SettingsMillisInput {
-                    label: "Stop duration",
-                    on_value: move |cycle_stop_duration_millis| {
+                SettingsCheckbox {
+                    label: "Enabled",
+                    on_checked: move |run_timer| {
                         save_settings(Settings {
-                            cycle_stop_duration_millis,
+                            run_timer,
                             ..settings.peek().clone()
                         });
                     },
-                    value: settings().cycle_stop_duration_millis,
-                }
-                SettingsEnumSelect::<CycleRunStopMode> {
-                    label: "Mode",
-                    on_selected: move |cycle_run_stop| {
-                        save_settings(Settings {
-                            cycle_run_stop,
-                            ..settings.peek().clone()
-                        });
-                    },
-                    selected: settings().cycle_run_stop,
+                    checked: settings().run_timer,
                 }
             }
         }
@@ -526,6 +521,16 @@ fn SectionOthers() -> Element {
                     checked: settings().enable_transparent_shape_solving,
                 }
                 SettingsCheckbox {
+                    label: "Enable Violetta solving",
+                    on_checked: move |enable_violetta_solving| {
+                        save_settings(Settings {
+                            enable_violetta_solving,
+                            ..settings.peek().clone()
+                        });
+                    },
+                    checked: settings().enable_violetta_solving,
+                }
+                SettingsCheckbox {
                     label: "Enable panic mode",
                     on_checked: move |enable_panic_mode| {
                         save_settings(Settings {
@@ -555,18 +560,21 @@ fn SectionOthers() -> Element {
                     },
                     checked: settings().stop_on_player_die,
                 }
-                div {}
-                FileInput {
-                    class: "flex-grow",
-                    on_file: move |file| async move {
-                        import_settings(file).await;
-                    },
-                    Button { class: "w-full", style: ButtonStyle::Primary, "Import" }
-                }
-                FileOutput {
-                    on_file: move |_| { serde_json::to_vec_pretty(&*settings.peek()).unwrap_or_default() },
-                    download: "settings.json",
-                    Button { class: "w-full", style: ButtonStyle::Primary, "Export" }
+                div { class: "col-span-full",
+                    div { class: "grid grid-cols-2 gap-3",
+                        FileInput {
+                            on_file: move |file| async move {
+                                import_settings(file).await;
+                            },
+                            Button { class: "w-full", style: ButtonStyle::Primary, "Import" }
+                        }
+
+                        FileOutput {
+                            on_file: move |_| { serde_json::to_vec_pretty(&*settings.peek()).unwrap_or_default() },
+                            download: "settings.json",
+                            Button { class: "w-full", style: ButtonStyle::Primary, "Export" }
+                        }
+                    }
                 }
             }
         }

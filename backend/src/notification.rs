@@ -7,21 +7,24 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Error, Ok, bail};
+use anyhow::{Error, bail};
 use bit_vec::BitVec;
 use log::{debug, error};
 use opencv::{
     core::{ToInputArray, Vector, VectorToVec},
     imgcodecs::imencode_def,
 };
-use reqwest::Url;
-use serenity::all::{CreateAttachment, ExecuteWebhook, Http, Webhook};
+use reqwest::{
+    Client, Url,
+    multipart::{Form, Part},
+};
+use serde_json::{Value, json};
 use tokio::{
     spawn,
     time::{Instant, sleep},
 };
 
-use crate::Settings;
+use crate::{Settings, WebhookProvider};
 
 static TRUE: bool = true;
 static FALSE: bool = false;
@@ -36,9 +39,9 @@ pub enum NotificationKind {
     PlayerStrangerAppear,
     PlayerFriendAppear,
     PlayerIsDead,
-    LieDetectorAppear,
-    CycledToHalt,
-    CycledToRun,
+    LieDetectorShapeAppear,
+    LieDetectorViolettaAppear,
+    RunTimerEnded,
 }
 
 impl NotificationKind {
@@ -59,12 +62,11 @@ impl NotificationKind {
             NotificationKind::PlayerFriendAppear => {
                 settings.notifications.notify_on_player_friend_appear
             }
-            NotificationKind::LieDetectorAppear => {
+            NotificationKind::LieDetectorViolettaAppear
+            | NotificationKind::LieDetectorShapeAppear => {
                 settings.notifications.notify_on_lie_detector_appear
             }
-            NotificationKind::CycledToHalt | NotificationKind::CycledToRun => {
-                settings.notifications.notify_on_cycle_run_stop
-            }
+            NotificationKind::RunTimerEnded => settings.notifications.notify_on_run_timer_end,
         }
     }
 
@@ -105,14 +107,12 @@ impl NotificationKind {
             NotificationKind::PlayerFriendAppear => {
                 format!("{user_id}Bot has detected friend player(s)")
             }
-            NotificationKind::LieDetectorAppear => {
+            NotificationKind::LieDetectorViolettaAppear
+            | NotificationKind::LieDetectorShapeAppear => {
                 format!("{user_id}Bot has detected the lie detector")
             }
-            NotificationKind::CycledToRun => {
-                format!("{user_id}Bot has cycled to run.")
-            }
-            NotificationKind::CycledToHalt => {
-                format!("{user_id}Bot has cycled to stop.")
+            NotificationKind::RunTimerEnded => {
+                format!("{user_id}Bot run timer has ended.")
             }
         }
     }
@@ -123,14 +123,15 @@ impl NotificationKind {
                 ScheduledFrame::new_deadline(2),
                 ScheduledFrame::new_deadline(4),
             ],
-            NotificationKind::CycledToHalt
-            | NotificationKind::CycledToRun
+            NotificationKind::RunTimerEnded
             | NotificationKind::EliteBossAppear
             | NotificationKind::PlayerIsDead
             | NotificationKind::PlayerGuildieAppear
             | NotificationKind::PlayerStrangerAppear
             | NotificationKind::PlayerFriendAppear => vec![ScheduledFrame::new_deadline(2)],
-            NotificationKind::RuneAppear | NotificationKind::LieDetectorAppear => {
+            NotificationKind::RuneAppear
+            | NotificationKind::LieDetectorShapeAppear
+            | NotificationKind::LieDetectorViolettaAppear => {
                 vec![ScheduledFrame::new_deadline(1)]
             }
         }
@@ -139,15 +140,15 @@ impl NotificationKind {
     fn schedule_delay_duration(&self) -> Duration {
         let secs = match self {
             NotificationKind::FailOrMapChange => 5,
-            NotificationKind::CycledToHalt
-            | NotificationKind::CycledToRun
+            NotificationKind::RunTimerEnded
             | NotificationKind::EliteBossAppear
             | NotificationKind::PlayerIsDead
             | NotificationKind::PlayerGuildieAppear
             | NotificationKind::PlayerStrangerAppear
             | NotificationKind::PlayerFriendAppear
             | NotificationKind::RuneAppear => 3,
-            NotificationKind::LieDetectorAppear => 2,
+            NotificationKind::LieDetectorShapeAppear
+            | NotificationKind::LieDetectorViolettaAppear => 2,
         };
 
         Duration::from_secs(secs)
@@ -180,14 +181,16 @@ struct ScheduledNotification {
     /// The kind of notification.
     kind: NotificationKind,
     /// The webhook url.
-    url: String,
+    url: Url,
+    /// The provider of the webhook service.
+    provider: WebhookProvider,
     /// The content of the message.
     content: String,
     /// The username of the message's owner.
     username: &'static str,
     /// Stores fixed size tuples of frame and frame deadline in seconds.
     ///
-    /// During each [`DiscordNotification::update_schedule`], the first frame not passing the
+    /// During each [`Notification::update_schedule`], the first frame not passing the
     /// deadline will try to capture the image from current game state. This is useful for showing
     /// `before and after` when map changes. So frame that cannot capture when the deadline is
     /// reached will be skipped.
@@ -210,7 +213,8 @@ impl ScheduledFrame {
 }
 
 #[derive(Debug)]
-pub struct DiscordNotification {
+pub struct Notification {
+    client: Client,
     /// A reference to [`Settings`] for checking if a notification is enabled.
     settings: Rc<RefCell<Settings>>,
     /// Stores pending notifications.
@@ -221,9 +225,10 @@ pub struct DiscordNotification {
     pending: Arc<Mutex<BitVec>>,
 }
 
-impl DiscordNotification {
+impl Notification {
     pub fn new(settings: Rc<RefCell<Settings>>) -> Self {
         Self {
+            client: Client::new(),
             settings,
             scheduled: Arc::new(Mutex::new(vec![])),
             pending: Arc::new(Mutex::new(BitVec::from_elem(
@@ -242,9 +247,6 @@ impl DiscordNotification {
         if !kind.enabled(&settings) {
             bail!("notification not enabled");
         }
-        if settings.notifications.discord_webhook_url.is_empty() {
-            bail!("webhook url not provided");
-        }
 
         {
             let mut pending = self.pending.lock().unwrap();
@@ -252,10 +254,10 @@ impl DiscordNotification {
                 bail!("notification is already sending");
             }
 
-            let url = settings.notifications.discord_webhook_url.clone();
-            if Url::try_from(url.as_str()).is_err() {
+            let provider = settings.notifications.webhook_provider;
+            let Ok(url) = Url::try_from(settings.notifications.webhook_url.as_str()) else {
                 bail!("failed to parse webhook url");
-            }
+            };
 
             let content = kind.content(&settings);
             let frames = kind.scheduled_frames();
@@ -264,13 +266,15 @@ impl DiscordNotification {
                 instant: Instant::now(),
                 kind,
                 url,
+                provider,
                 content,
-                username: "maple-bot",
+                username: "Komari",
                 frames,
             });
             pending.set(kind.into(), true);
         }
 
+        let client = self.client.clone();
         let delay = kind.schedule_delay_duration();
         let pending = self.pending.clone();
         let scheduled = self.scheduled.clone();
@@ -294,7 +298,7 @@ impl DiscordNotification {
                 notification
             };
 
-            let _ = post_notification(notification).await;
+            let _ = post_notification(client, notification).await;
         });
 
         Ok(())
@@ -328,31 +332,63 @@ impl DiscordNotification {
     }
 }
 
-async fn post_notification(notification: ScheduledNotification) -> Result<(), Error> {
-    let http = Http::new("");
-    let webhook = Webhook::from_url(&http, &notification.url).await?;
-    let files = notification
+async fn post_notification(
+    client: Client,
+    notification: ScheduledNotification,
+) -> Result<(), Error> {
+    match notification.provider {
+        WebhookProvider::Discord => post_discord_notification(client, notification).await,
+    }
+}
+
+async fn post_discord_notification(
+    client: Client,
+    notification: ScheduledNotification,
+) -> Result<(), Error> {
+    let attachments = notification
+        .frames
+        .iter()
+        .filter(|frame| frame.inner.is_some())
+        .enumerate()
+        .map(|(i, _)| {
+            json!({
+                "id": i,
+                "description": format!("Game snapshot #{i}"),
+                "filename": format!("image_{i}.png"),
+            })
+        })
+        .collect::<Vec<Value>>();
+    let body = json!({
+        "content": notification.content,
+        "username": notification.username,
+        "attachments": attachments,
+    });
+    let mut form = Form::new().text("payload_json", serde_json::to_string(&body).unwrap());
+    for (i, frame) in notification
         .frames
         .into_iter()
         .filter_map(|frame| frame.inner)
         .enumerate()
-        .map(|(index, frame)| {
-            CreateAttachment::bytes(frame, format!("image_{index}.png"))
-                .description(format!("Game snapshot #{index}"))
-        });
+    {
+        form = form.part(
+            format!("files[{i}]"),
+            Part::bytes(frame)
+                .mime_str("image/png")
+                .unwrap()
+                .file_name(format!("image_{i}.png")),
+        );
+    }
 
-    let builder = ExecuteWebhook::new()
-        .content(notification.content)
-        .username(notification.username)
-        .files(files);
-    let _ = webhook
-        .execute(&http, false, builder)
+    let _ = client
+        .post(notification.url)
+        .multipart(form)
+        .send()
         .await
         .inspect(|_| {
-            debug!(target: "notification", "calling Webhook API {:?} succeeded", notification.kind);
+            debug!(target: "backend/notification", "calling Webhook API {:?} succeeded", notification.kind);
         })
         .inspect_err(|err| {
-            error!(target: "notification", "calling Webhook API failed {err}");
+            error!(target: "backend/notification", "calling Webhook API failed {err}");
         });
 
     Ok(())
@@ -363,16 +399,19 @@ mod test {
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
     use opencv::core::{CV_8UC4, Mat, MatExprTraitConst};
+    use reqwest::Url;
     use tokio::time::{Instant, advance};
 
-    use super::{DiscordNotification, NotificationKind, ScheduledNotification};
-    use crate::{Notifications, Settings, mat::OwnedMat, notification::ScheduledFrame};
+    use super::{Notification, NotificationKind, ScheduledNotification};
+    use crate::{
+        Notifications, Settings, WebhookProvider, mat::OwnedMat, notification::ScheduledFrame,
+    };
 
     #[tokio::test(start_paused = true)]
     async fn schedule_kind_unique() {
-        let noti = DiscordNotification::new(Rc::new(RefCell::new(Settings {
+        let noti = Notification::new(Rc::new(RefCell::new(Settings {
             notifications: Notifications {
-                discord_webhook_url: "https://discord.com/api/webhooks/foo/bar".to_string(),
+                webhook_url: "https://discord.com/api/webhooks/foo/bar".to_string(),
                 notify_on_fail_or_change_map: true,
                 notify_on_rune_appear: true,
                 ..Default::default()
@@ -404,7 +443,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn schedule_invalid_url() {
-        let noti = DiscordNotification::new(Rc::new(RefCell::new(Settings {
+        let noti = Notification::new(Rc::new(RefCell::new(Settings {
             notifications: Notifications {
                 notify_on_fail_or_change_map: true,
                 ..Default::default()
@@ -421,11 +460,12 @@ mod test {
     #[tokio::test(start_paused = true)]
     #[allow(clippy::await_holding_lock)]
     async fn update_scheduled_frames_deadline() {
-        let noti = DiscordNotification::new(Rc::new(RefCell::new(Settings::default())));
+        let noti = Notification::new(Rc::new(RefCell::new(Settings::default())));
         noti.scheduled.lock().unwrap().push(ScheduledNotification {
             instant: Instant::now(),
             kind: NotificationKind::FailOrMapChange,
-            url: "https://example.com".into(),
+            url: Url::parse("https://example.com").unwrap(),
+            provider: WebhookProvider::Discord,
             content: "content".into(),
             username: "username",
             frames: vec![

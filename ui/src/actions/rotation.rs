@@ -49,7 +49,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
             RotationMode::PingPong => {
                 map.rotation_ping_pong_bound = bound;
             }
-        };
+        }
         save_map(map);
     };
 
@@ -78,6 +78,12 @@ pub fn SectionRotation(disabled: bool) -> Element {
         };
         popup_content.set(PopupContent::Bound(bound));
     };
+
+    use_effect(move || {
+        if !popup_open() {
+            popup_content.set(PopupContent::None);
+        }
+    });
 
     rsx! {
         PopupContext {

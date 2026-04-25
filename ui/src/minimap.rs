@@ -334,10 +334,15 @@ pub fn MinimapScreen() -> Element {
     let state = use_signal::<Option<MinimapState>>(|| None);
     // Handles async operations for map-related
     let coroutine = use_coroutine(move |mut rx: UnboundedReceiver<MinimapUpdate>| async move {
+        let mut set_map_preset = move |new_map: Option<Map>, new_preset: Option<String>| {
+            map.set(new_map);
+            map_preset.set(new_preset);
+        };
+
         while let Some(message) = rx.next().await {
             match message {
                 MinimapUpdate::Set => {
-                    update_map(map_preset(), map()).await;
+                    update_map(map(), map_preset()).await;
                 }
                 MinimapUpdate::Create(name) => {
                     let Some(new_map) = create_map(name).await else {
@@ -347,19 +352,20 @@ pub fn MinimapScreen() -> Element {
                         continue;
                     };
 
-                    map.set(Some(new_map));
-                    map_preset.set(None);
-                    update_map(None, map()).await;
+                    set_map_preset(Some(new_map), None);
+                    update_map(map(), None).await;
                 }
-                MinimapUpdate::Import(map) => {
-                    upsert_map(map).await;
+                MinimapUpdate::Import(imported_map) => {
+                    let imported_map = upsert_map(imported_map).await;
+                    set_map_preset(imported_map, None);
+                    update_map(map(), None).await;
                 }
                 MinimapUpdate::Delete => {
                     if let Some(current_map) = map()
                         && delete_map(current_map).await
                     {
-                        map.set(None);
-                        map_preset.set(None);
+                        set_map_preset(None, None);
+                        update_map(None, None).await;
                     }
                 }
             }
@@ -404,10 +410,10 @@ pub fn MinimapScreen() -> Element {
     });
 
     rsx! {
-        div { class: "relative flex flex-col flex-none w-xs xl:w-md z-0",
+        div { class: "relative flex flex-col flex-none w-xs z-0",
             div {
-                class: "absolute inset-0 bg-no-repeat bg-center w-[130%] -z-1",
-                style: "background-image: url({BACKGROUND}); background-size: 100%; background-position: -10px 120px;",
+                class: "absolute inset-0 bg-no-repeat w-[200%] -z-1",
+                style: "background-image: url({BACKGROUND}); background-size: 800px; background-position: -165px 160px;",
             }
             Canvas {
                 state,
@@ -470,17 +476,12 @@ fn Canvas(
     map_preset: ReadSignal<Option<String>>,
     position: Signal<(i32, i32)>,
 ) -> Element {
-    let mut platforms_bound = use_signal(|| None);
     let rotation_bound_and_type = use_memo(move || {
-        let platforms_bound = platforms_bound();
         let map = map()?;
 
         match map.rotation_mode {
             RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => None,
-            RotationMode::AutoMobbing => Some((
-                platforms_bound.unwrap_or(map.rotation_auto_mob_bound),
-                "AutoMobbing",
-            )),
+            RotationMode::AutoMobbing => Some((map.rotation_auto_mob_bound, "AutoMobbing")),
             RotationMode::PingPong => Some((map.rotation_ping_pong_bound, "PingPong")),
             RotationMode::MonsterPark => Some((
                 platforms_bound.unwrap_or(map.rotation_auto_mob_bound),
@@ -538,7 +539,6 @@ fn Canvas(
                 continue;
             };
             let destinations = current_state.destinations;
-            let bound = current_state.platforms_bound;
             let quadrant = current_state
                 .auto_mob_quadrant
                 .map(|quadrant| quadrant.to_string());
@@ -556,9 +556,6 @@ fn Canvas(
                 detected_size: frame.as_ref().map(|(_, width, height)| (*width, *height)),
             };
 
-            if *platforms_bound.peek() != bound {
-                platforms_bound.set(bound);
-            }
             if *position.peek() != current_state.position.unwrap_or_default() {
                 position.set(current_state.position.unwrap_or_default());
             }
@@ -585,7 +582,7 @@ fn Canvas(
     });
 
     rsx! {
-        div { class: "relative h-31 xl:h-38 rounded-2xl bg-secondary-surface",
+        div { class: "relative h-31 rounded-2xl bg-secondary-surface",
             canvas {
                 class: "absolute inset-0 rounded-2xl w-full h-full",
                 id: "canvas-map",
@@ -611,7 +608,7 @@ fn Info(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>) -
         input_state: String,
         detected_map_size: String,
         selected_map_size: String,
-        cycle_duration: String,
+        run_timer_duration: String,
     }
 
     let info = use_memo(move || {
@@ -625,7 +622,7 @@ fn Info(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>) -
             input_state: "Unknown".to_string(),
             detected_map_size: "Unknown".to_string(),
             selected_map_size: "Unknown".to_string(),
-            cycle_duration: "None".to_string(),
+            run_timer_duration: "None".to_string(),
         };
 
         if let Some(map) = map() {
@@ -636,10 +633,10 @@ fn Info(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>) -
             info.state = state.state;
             info.erda_shower_state = state.erda_shower_state;
             info.input_state = state.input_state;
-            info.cycle_duration = match state.operation {
+            info.run_timer_duration = match state.operation {
                 Operation::Halting | Operation::Running => "None".to_string(),
                 Operation::TemporaryHalting(duration) => duration_from(duration),
-                Operation::HaltUntil(instant) | Operation::RunUntil(instant) => {
+                Operation::RunUntil(instant) => {
                     duration_from(instant.saturating_duration_since(Instant::now()))
                 }
             };
@@ -667,13 +664,13 @@ fn Info(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>) -
         div { class: "grid grid-cols-2 items-center justify-center px-4 py-3 gap-1",
             InfoItem { name: "State", value: info().state }
             InfoItem { name: "Position", value: info().position }
-            InfoItem { name: "Health", value: info().health }
+            InfoItem { name: "HP", value: info().health }
             InfoItem { name: "Priority action", value: info().priority_action }
             InfoItem { name: "Normal action", value: info().normal_action }
             InfoItem { name: "Erda Shower", value: info().erda_shower_state }
             InfoItem { name: "Detected size", value: info().detected_map_size }
             InfoItem { name: "Selected size", value: info().selected_map_size }
-            InfoItem { name: "Run/stop cycle", value: info().cycle_duration }
+            InfoItem { name: "Run timer", value: info().run_timer_duration }
             InfoItem { name: "Input method", value: info().input_state }
         }
     }
@@ -694,9 +691,7 @@ fn Buttons(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>
             .map(|state| match state.operation {
                 Operation::Halting => OperationUpdate::Halt,
                 Operation::TemporaryHalting(_) => OperationUpdate::TemporaryHalt,
-                Operation::HaltUntil(_) | Operation::Running | Operation::RunUntil(_) => {
-                    OperationUpdate::Run
-                }
+                Operation::Running | Operation::RunUntil(_) => OperationUpdate::Run,
             })
             .unwrap_or(OperationUpdate::Halt)
     });
@@ -717,10 +712,7 @@ fn Buttons(state: ReadSignal<Option<MinimapState>>, map: ReadSignal<Option<Map>>
         state()
             .map(|state| match state.operation {
                 Operation::TemporaryHalting(_) => "Resume",
-                Operation::Halting
-                | Operation::HaltUntil(_)
-                | Operation::Running
-                | Operation::RunUntil(_) => "Suspend",
+                Operation::Halting | Operation::Running | Operation::RunUntil(_) => "Suspend",
             })
             .unwrap_or("Suspend")
     });

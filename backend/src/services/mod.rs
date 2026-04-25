@@ -21,18 +21,15 @@ use crate::{
     bridge::{Capture, DefaultInputReceiver, Input, InputMethod},
     database_event_receiver,
     ecs::{Resources, World, WorldEvent},
-    navigator::Navigator,
     rotator::Rotator,
     services::{
         capture::{CaptureService, DefaultCaptureService},
         character::{CharacterService, DefaultCharacterService},
-        control::{ControlEventHandler, ControlService, DefaultControlService},
         database::DatabaseEventHandler,
         input::{DefaultInputService, InputEventHandler, InputService},
         localization::{DefaultLocalizationService, LocalizationService},
         map::{DefaultMapService, MapService},
         mediator::{DefaultMediatorService, MediatorEventHandler, MediatorService},
-        navigator::{DefaultNavigatorService, NavigatorService},
         operation::{DefaultOperationService, OperationEventHandler, OperationService},
         rotator::{DefaultRotatorService, RotatorService},
         settings::{DefaultSettingsService, SettingsService},
@@ -42,7 +39,6 @@ use crate::{
 
 mod capture;
 mod character;
-mod control;
 mod database;
 #[cfg(debug_assertions)]
 mod debug;
@@ -50,7 +46,6 @@ mod input;
 mod localization;
 mod map;
 mod mediator;
-mod navigator;
 mod operation;
 mod rotator;
 mod settings;
@@ -97,17 +92,14 @@ struct EventContext<'a> {
     pub resources: &'a mut Resources,
     pub world: &'a mut World,
     pub rotator: &'a mut dyn Rotator,
-    pub navigator: &'a mut dyn Navigator,
     pub capture: &'a mut dyn Capture,
     pub map_service: &'a mut Box<dyn MapService>,
     pub character_service: &'a mut Box<dyn CharacterService>,
     pub rotator_service: &'a mut Box<dyn RotatorService>,
-    pub navigator_service: &'a mut Box<dyn NavigatorService>,
     pub capture_service: &'a mut Box<dyn CaptureService>,
     pub input_service: &'a mut Box<dyn InputService>,
     pub settings_service: &'a mut Box<dyn SettingsService>,
     pub localization_service: &'a mut Box<dyn LocalizationService>,
-    pub control_service: &'a mut Box<dyn ControlService>,
     pub operation_service: &'a mut Box<dyn OperationService>,
     pub mediator_service: &'a mut Box<dyn MediatorService>,
     #[cfg(debug_assertions)]
@@ -121,12 +113,10 @@ pub struct Services {
     map: Box<dyn MapService>,
     character: Box<dyn CharacterService>,
     rotator: Box<dyn RotatorService>,
-    navigator: Box<dyn NavigatorService>,
     capture: Box<dyn CaptureService>,
     input: Box<dyn InputService>,
     settings: Box<dyn SettingsService>,
     localization: Box<dyn LocalizationService>,
-    control: Box<dyn ControlService>,
     operation: Box<dyn OperationService>,
     mediator: Box<dyn MediatorService>,
     #[cfg(debug_assertions)]
@@ -140,7 +130,7 @@ impl Services {
         mut world_event_rx: Receiver<WorldEvent>,
     ) -> Self {
         let capture_service = DefaultCaptureService::new();
-        let settings_service = DefaultSettingsService::new(settings.clone());
+        let settings_service = DefaultSettingsService::new(settings);
 
         let mut rotator = DefaultRotatorService::default();
         rotator.update_from_settings(&settings_service.settings());
@@ -149,9 +139,6 @@ impl Services {
         let input_rx = DefaultInputReceiver::new(window, InputKind::Focused);
         let input_service = DefaultInputService::new(input_rx);
         let mut input_event_rx = input_service.subscribe_event();
-
-        let (mut control, mut control_event_rx) = DefaultControlService::new();
-        control.update(&settings_service.settings());
 
         let operation_service = DefaultOperationService::default();
         let mut operation_event_rx = operation_service.subscribe();
@@ -164,7 +151,6 @@ impl Services {
         };
         event_bus.subscribe(MediatorEventHandler);
         event_bus.subscribe(DatabaseEventHandler);
-        event_bus.subscribe(ControlEventHandler);
         event_bus.subscribe(WorldEventHandler);
         event_bus.subscribe(OperationEventHandler);
         event_bus.subscribe(InputEventHandler);
@@ -174,7 +160,6 @@ impl Services {
             loop {
                 let event: Box<dyn Event> = select! {
                     Some(event) = mediator_event_rx.recv() => Box::new(event),
-                    Some(event) = control_event_rx.recv() => Box::new(event),
                     Ok(event) = world_event_rx.recv() => Box::new(event),
                     Ok(event) = operation_event_rx.recv() => Box::new(event),
                     Ok(event) = input_event_rx.recv() => Box::new(event),
@@ -183,7 +168,7 @@ impl Services {
                 match event_tx.send(event) {
                     Ok(_) => (),
                     Err(err) => {
-                        error!(target: "services", "error when occured trying to send event {err}");
+                        error!(target: "backend/services", "error when occured trying to send event {err}");
                         break;
                     }
                 }
@@ -196,12 +181,10 @@ impl Services {
             map: Box::new(DefaultMapService::default()),
             character: Box::new(DefaultCharacterService::default()),
             rotator: Box::new(rotator),
-            navigator: Box::new(DefaultNavigatorService),
             capture: Box::new(capture_service),
             input: Box::new(input_service),
             settings: Box::new(settings_service),
             localization: Box::new(DefaultLocalizationService::new(localization)),
-            control: Box::new(control),
             operation: Box::new(operation_service),
             mediator: Box::new(mediator_service),
             #[cfg(debug_assertions)]
@@ -230,7 +213,6 @@ impl Services {
         resources: &mut Resources,
         world: &mut World,
         rotator: &mut dyn Rotator,
-        navigator: &mut dyn Navigator,
         capture: &mut dyn Capture,
     ) {
         if let Ok(event) = self.event_rx.try_recv() {
@@ -238,29 +220,25 @@ impl Services {
                 resources,
                 world,
                 rotator,
-                navigator,
                 capture,
                 map_service: &mut self.map,
                 character_service: &mut self.character,
                 rotator_service: &mut self.rotator,
-                navigator_service: &mut self.navigator,
                 capture_service: &mut self.capture,
                 input_service: &mut self.input,
                 settings_service: &mut self.settings,
                 localization_service: &mut self.localization,
-                control_service: &mut self.control,
                 operation_service: &mut self.operation,
                 mediator_service: &mut self.mediator,
                 #[cfg(debug_assertions)]
                 debug_service: &mut self.debug,
             };
-            debug!(target: "services", "processing event {event:?}");
+            debug!(target: "backend/services", "processing event {event:?}");
             self.event_bus.emit(&mut context, event);
         }
 
         #[cfg(debug_assertions)]
         self.debug.poll(resources);
-        self.mediator
-            .broadcast_state(resources, world, self.map.map());
+        self.mediator.broadcast_state(resources, world);
     }
 }

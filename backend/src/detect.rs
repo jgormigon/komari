@@ -19,10 +19,6 @@ use opencv::{
         copy_make_border, divide2_def, extract_channel, find_non_zero, min_max_loc, no_array,
         subtract_def, transpose_nd,
     },
-    dnn::{
-        ModelTrait, TextRecognitionModel, TextRecognitionModelTrait,
-        TextRecognitionModelTraitConst, read_net_from_onnx_buffer,
-    },
     imgcodecs::{self, IMREAD_COLOR, IMREAD_GRAYSCALE, imdecode, imencode_def},
     imgproc::{
         CC_STAT_AREA, CC_STAT_HEIGHT, CC_STAT_LEFT, CC_STAT_TOP, CC_STAT_WIDTH,
@@ -38,6 +34,7 @@ use ort::{
     session::{Session, SessionInputValue, SessionOutputs},
     value::TensorRef,
 };
+use strsim::jaro_winkler;
 
 use crate::mat::OwnedMat;
 use crate::{bridge::KeyKind, models::Localization};
@@ -93,6 +90,7 @@ pub enum BuffKind {
     ExpCouponX3,
     ExpCouponX4,
     BonusExpCoupon,
+    MvpBonusExpCoupon,
     LegionWealth,
     LegionLuck,
     WealthAcquisitionPotion,
@@ -132,7 +130,13 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects a list of mobs.
     ///
     /// Returns a list of mobs coordinate relative to minimap coordinate.
-    fn detect_mobs(&self, minimap: Rect, bound: Rect, player: Point) -> Result<Vec<Point>>;
+    fn detect_mobs(
+        &self,
+        minimap: Rect,
+        bound: Rect,
+        player: Point,
+        player_name: Option<String>,
+    ) -> Result<Vec<Point>>;
 
     /// Detects whether to press ESC for unstucking.
     fn detect_esc_settings(&self) -> bool;
@@ -152,20 +156,6 @@ pub trait Detector: Debug + Send + Sync {
     /// the minimap's white border.
     fn detect_minimap(&self, border_threshold: u8) -> Result<Rect>;
 
-    /// Detects the minimap name rectangle.
-    fn detect_minimap_name(&self, minimap: Rect) -> Result<Rect>;
-
-    /// Detects whether the given `minimap_snapshot` and `minimap_name_snapshot` matches the one
-    /// cropped by `minimap_name_bbox` and `minimap_bbox` rectangles.
-    fn detect_minimap_match(
-        &self,
-        minimap_snapshot: &Mat,
-        minimap_snapshot_grayscale: bool,
-        minimap_name_snapshot: &Mat,
-        minimap_bbox: Rect,
-        minimap_name_bbox: Rect,
-    ) -> Result<f64>;
-
     /// Detects the portals from the given `minimap` rectangle.
     ///
     /// Returns `Rect` relative to `minimap` coordinate.
@@ -180,6 +170,11 @@ pub trait Detector: Debug + Send + Sync {
     ///
     /// Returns `Rect` relative to `minimap` coordinate.
     fn detect_player(&self, minimap: Rect) -> Result<Rect>;
+
+    /// Detects the player's name.
+    ///
+    /// Only English name is currently supported.
+    fn detect_player_name(&self) -> Result<String>;
 
     /// Detects whether a player of `kind` is in the minimap.
     fn detect_player_kind(&self, minimap: Rect, kind: OtherPlayerKind) -> bool;
@@ -248,19 +243,23 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects whether the change channel menu is opened.
     fn detect_change_channel_menu_opened(&self) -> bool;
 
-    /// Detects whether the chat menu is opened.
-    fn detect_chat_menu_opened(&self) -> bool;
-
     /// Detects whether the admin image is visible inside the currently opened popup/dialog.
     fn detect_admin_visible(&self) -> bool;
 
     /// Detects whether there is a timer (e.g. from using booster).
     fn detect_timer_visible(&self) -> bool;
 
-    /// Detects the lie detector popup.
-    fn detect_lie_detector(&self) -> Result<Rect>;
+    /// Detects the transparent shape's lie detector popup.
+    fn detect_lie_detector_shape(&self) -> Result<Rect>;
 
-    fn detect_lie_detector_preparing(&self) -> bool;
+    /// Detects whether transparent shape's lie detector is preparing.
+    fn detect_lie_detector_shape_preparing(&self) -> bool;
+
+    /// Detects the violetta's lie detector popup.
+    fn detect_lie_detector_violetta(&self) -> Result<Rect>;
+
+    /// Detects whether violetta's lie detector is preparing.
+    fn detect_lie_detector_violetta_preparing(&self) -> bool;
 
     /// Detects the state for HEXA Booster in the quick slots.
     fn detect_quick_slots_hexa_booster(&self) -> Result<QuickSlotsHexaBooster>;
@@ -286,7 +285,18 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects a list of transparent shapes during lie detector event.
     ///
     /// The returned [`Rect`]s have coordinates relative to `region`.
-    fn detect_transparent_shapes(&self, region: Rect) -> Vec<Rect>;
+    fn detect_transparent_shapes(&self, region: Rect) -> Vec<(Rect, f32)>;
+
+    /// Detects a list of mushrooms during Violetta lie detector event.
+    ///
+    /// The returned [`Rect`]s have coordinates relative to `region`.
+    fn detect_violetta_mushrooms(&self, region: Rect) -> Vec<(Rect, f32)>;
+
+    /// Detects violetta's face.
+    fn detect_violetta_face(&self, region: Rect) -> Result<Rect>;
+
+    /// Detects violetta's number boxes.
+    fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect>;
 }
 
 type MatFn = Box<dyn FnOnce() -> Mat + Send>;
@@ -338,8 +348,14 @@ impl Detector for DefaultDetector {
         &self.grayscale
     }
 
-    fn detect_mobs(&self, minimap: Rect, bound: Rect, player: Point) -> Result<Vec<Point>> {
-        detect_mobs(self.bgr(), minimap, bound, player)
+    fn detect_mobs(
+        &self,
+        minimap: Rect,
+        bound: Rect,
+        player: Point,
+        player_name: Option<String>,
+    ) -> Result<Vec<Point>> {
+        detect_mobs(self.bgr(), minimap, bound, player, player_name)
     }
 
     fn detect_esc_settings(&self) -> bool {
@@ -362,29 +378,6 @@ impl Detector for DefaultDetector {
         detect_minimap(self.bgr(), border_threshold)
     }
 
-    fn detect_minimap_name(&self, minimap: Rect) -> Result<Rect> {
-        detect_minimap_name(self.grayscale(), minimap)
-    }
-
-    fn detect_minimap_match(
-        &self,
-        minimap_snapshot: &Mat,
-        minimap_snapshot_grayscale: bool,
-        minimap_name_snapshot: &Mat,
-        minimap_bbox: Rect,
-        minimap_name_bbox: Rect,
-    ) -> Result<f64> {
-        detect_minimap_match(
-            &self.bgra(),
-            self.grayscale(),
-            minimap_snapshot,
-            minimap_snapshot_grayscale,
-            minimap_name_snapshot,
-            minimap_bbox,
-            minimap_name_bbox,
-        )
-    }
-
     fn detect_minimap_portals(&self, minimap: Rect) -> Vec<Rect> {
         detect_minimap_portals(self.bgr().roi(minimap).unwrap())
     }
@@ -395,6 +388,10 @@ impl Detector for DefaultDetector {
 
     fn detect_player(&self, minimap: Rect) -> Result<Rect> {
         detect_player(&self.bgr().roi(minimap).unwrap())
+    }
+
+    fn detect_player_name(&self) -> Result<String> {
+        detect_player_name(self.bgr(), self.grayscale())
     }
 
     fn detect_player_kind(&self, minimap: Rect, kind: OtherPlayerKind) -> bool {
@@ -431,6 +428,7 @@ impl Detector for DefaultDetector {
             | BuffKind::ExpCouponX3
             | BuffKind::ExpCouponX4
             | BuffKind::BonusExpCoupon
+            | BuffKind::MvpBonusExpCoupon
             | BuffKind::ForTheGuild
             | BuffKind::HardHitter => &to_buffs_region(self.grayscale()),
             BuffKind::LegionWealth
@@ -504,10 +502,6 @@ impl Detector for DefaultDetector {
         detect_change_channel_menu_opened(self.grayscale(), &self.localization)
     }
 
-    fn detect_chat_menu_opened(&self) -> bool {
-        detect_chat_menu_opened(self.grayscale())
-    }
-
     fn detect_admin_visible(&self) -> bool {
         detect_admin_visible(self.grayscale())
     }
@@ -516,12 +510,20 @@ impl Detector for DefaultDetector {
         detect_timer_visible(self.grayscale(), &self.localization)
     }
 
-    fn detect_lie_detector(&self) -> Result<Rect> {
-        detect_lie_detector(self.bgr())
+    fn detect_lie_detector_shape(&self) -> Result<Rect> {
+        detect_lie_detector_shape(self.bgr(), &self.localization)
     }
 
-    fn detect_lie_detector_preparing(&self) -> bool {
-        detect_lie_detector_preparing(self.bgr()).is_ok()
+    fn detect_lie_detector_shape_preparing(&self) -> bool {
+        detect_lie_detector_shape_preparing(self.bgr()).is_ok()
+    }
+
+    fn detect_lie_detector_violetta(&self) -> Result<Rect> {
+        detect_lie_detector_violetta(self.bgr(), &self.localization)
+    }
+
+    fn detect_lie_detector_violetta_preparing(&self) -> bool {
+        detect_lie_detector_violetta_preparing(self.bgr()).is_ok()
     }
 
     fn detect_quick_slots_hexa_booster(&self) -> Result<QuickSlotsHexaBooster> {
@@ -552,8 +554,20 @@ impl Detector for DefaultDetector {
         detect_hexa_sol_erda(self.grayscale())
     }
 
-    fn detect_transparent_shapes(&self, region: Rect) -> Vec<Rect> {
+    fn detect_transparent_shapes(&self, region: Rect) -> Vec<(Rect, f32)> {
         detect_transparent_shapes(&self.bgr().roi(region).unwrap())
+    }
+
+    fn detect_violetta_mushrooms(&self, region: Rect) -> Vec<(Rect, f32)> {
+        detect_violetta_mushrooms(&self.bgr().roi(region).unwrap())
+    }
+
+    fn detect_violetta_face(&self, region: Rect) -> Result<Rect> {
+        detect_violetta_face(&self.bgr().roi(region).unwrap())
+    }
+
+    fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect> {
+        detect_violetta_numbers(&self.bgr().roi(region).unwrap())
     }
 }
 
@@ -562,6 +576,7 @@ fn detect_mobs(
     minimap: Rect,
     bound: Rect,
     player: Point,
+    player_name: Option<String>,
 ) -> Result<Vec<Point>> {
     static MOB_MODEL: LazyLock<Mutex<Session>> = LazyLock::new(|| {
         Mutex::new(
@@ -572,53 +587,53 @@ fn detect_mobs(
 
     /// Approximates the mob coordinate on screen to mob coordinate on minimap.
     ///
-    /// This function tries to approximate the delta (dx, dy) that the player needs to move
-    /// in relative to the minimap coordinate in order to reach the mob. Returns the mob
+    /// This function tries to approximate the delta `(dx, dy)` that the player needs to move
+    /// in relative to the minimap coordinate in order to reach the mob. And returns the mob
     /// coordinate on the minimap by adding the delta to the player position.
-    ///
-    /// Note: It is not that accurate but that is that and this is this. Hey it seems better than
-    /// the previous alchemy.
     #[inline]
     fn to_minimap_coordinate(
         mob_bbox: Rect,
         minimap_bbox: Rect,
         mobbing_bound: Rect,
         player: Point,
+        player_on_screen: Option<Rect>,
         mat_size: Size,
     ) -> Option<Point> {
-        // These numbers are for scaling dx/dy on the screen to dx/dy on the minimap.
-        // They are approximated in 1280x720 resolution by going from one point to another point
-        // from the middle of the screen with both points visible on screen before traveling. Take
-        // the distance traveled on the minimap and divide it by half of the resolution
-        // (e.g. tralveled minimap x / 640). Whether it is correct or not, time will tell.
         const X_SCALE: f32 = 0.059_375;
         const Y_SCALE: f32 = 0.036_111;
 
-        // The main idea is to calculate the offset of the detected mob from the middle of screen
-        // and use that distance as dx/dy to move the player. This assumes the player will
-        // most of the time be near or very close to the middle of the screen. This is already
-        // not accurate in the sense that the camera will have a bit of lag before
-        // it is centered again on the player. And when the player is near edges of the map,
-        // this function is just plain wrong. For better accuracy, detecting where the player is
-        // on the screen and use that as the basis is required.
-        let x_screen_mid = mat_size.width / 2;
         let x_mob_mid = mob_bbox.x + mob_bbox.width / 2;
-        let x_screen_delta = x_screen_mid - x_mob_mid;
+        let x_screen_delta = if let Some(screen) = player_on_screen {
+            screen.x + screen.width / 2 - x_mob_mid
+        } else {
+            mat_size.width / 2 - x_mob_mid
+        };
         let x_minimap_delta = (x_screen_delta as f32 * X_SCALE) as i32;
 
-        // For dy, if the whole mob bounding box is above the screen mid point, then the
-        // box top edge is used to increase the dy distance as to help the player move up. The same
-        // goes for moving down. If the bounding box overlaps with the screen mid point, the box
-        // mid point is used as to to help the player stay in place.
-        let y_screen_mid = mat_size.height / 2;
-        let y_mob = if mob_bbox.y + mob_bbox.height < y_screen_mid {
-            mob_bbox.y
-        } else if mob_bbox.y > y_screen_mid {
-            mob_bbox.y + mob_bbox.height
-        } else {
-            mob_bbox.y + mob_bbox.height / 2
+        let y_screen_delta = match player_on_screen {
+            Some(screen) => {
+                let y_screen_mid = screen.y + screen.height / 2;
+                let y_mob = if mob_bbox.y > y_screen_mid {
+                    mob_bbox.y + mob_bbox.height
+                } else {
+                    mob_bbox.y + mob_bbox.height / 2
+                };
+
+                y_screen_mid - y_mob
+            }
+            None => {
+                let y_screen_mid = mat_size.height / 2;
+                let y_mob = if mob_bbox.y + mob_bbox.height < y_screen_mid {
+                    mob_bbox.y
+                } else if mob_bbox.y > y_screen_mid {
+                    mob_bbox.y + mob_bbox.height
+                } else {
+                    mob_bbox.y + mob_bbox.height / 2
+                };
+
+                y_screen_mid - y_mob
+            }
         };
-        let y_screen_delta = y_screen_mid - y_mob;
         let y_minimap_delta = (y_screen_delta as f32 * Y_SCALE) as i32;
 
         let point_x = if x_minimap_delta > 0 {
@@ -646,13 +661,70 @@ fn detect_mobs(
     let result = model.run([to_input_value(&mat_in)]).unwrap();
     let result = from_output_value(&result);
     // SAFETY: 0..result.rows() is within Mat bounds
+    let player_on_screen = player_name.and_then(|name| detect_player_on_screen(bgr, name).ok());
     let points = (0..result.rows())
         .map(|i| unsafe { result.at_row_unchecked::<f32>(i).unwrap() })
         .filter(|pred| pred[4] >= 0.5)
         .map(|pred| remap_from_yolo(pred, size, w_ratio, h_ratio, left, top))
-        .filter_map(|bbox| to_minimap_coordinate(bbox, minimap, bound, player, size))
+        .filter_map(|bbox| {
+            to_minimap_coordinate(bbox, minimap, bound, player, player_on_screen, size)
+        })
         .collect::<Vec<_>>();
     Ok(points)
+}
+
+fn detect_player_name(bgr: &impl MatTraitConst, grayscale: &impl ToInputArray) -> Result<String> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("LEVEL_TEMPLATE")), IMREAD_GRAYSCALE).unwrap()
+    });
+
+    let name_area = detect_template(grayscale, &*TEMPLATE, Point::new(55, -6), 0.75)
+        .map(|level| Rect::new(level.x, level.y, 100, 25))?;
+    let bgr = bgr.roi(name_area)?;
+
+    let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes(&bgr);
+    let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
+    let name_area = name_area - name_area.tl();
+    let name_bbox = bboxes
+        .iter()
+        .find(|&&bbox| (bbox & name_area).area() > 0)
+        .copied()
+        .ok_or(anyhow!("failed to find name bbox"))?;
+
+    extract_texts(&bgr, &[name_bbox])
+        .into_iter()
+        .next()
+        .ok_or(anyhow!("failed to detect name text"))
+}
+
+fn detect_player_on_screen(bgr: &impl MatTraitConst, name: String) -> Result<Rect> {
+    let size = bgr.size().unwrap();
+    let player_area = Rect::new(
+        (size.width as f32 * 0.3) as i32,
+        (size.height as f32 * 0.3) as i32,
+        (size.width as f32 * 0.45) as i32,
+        (size.height as f32 * 0.65) as i32,
+    );
+    let bgr = bgr.roi(player_area)?;
+
+    let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes_magnified(&bgr, 1.0);
+    let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
+    let texts = extract_texts(&bgr, &bboxes);
+    let index = texts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| {
+            let score = jaro_winkler(text.as_str(), name.as_str());
+            if score < 0.7 {
+                return None;
+            }
+            Some((index, score))
+        })
+        .max_by(|(_, first), (_, second)| first.partial_cmp(second).unwrap())
+        .ok_or(anyhow!("failed to find player bbox"))?
+        .0;
+
+    Ok(bboxes[index] + player_area.tl())
 }
 
 pub static POPUP_CONFIRM_TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
@@ -998,7 +1070,7 @@ fn detect_minimap(bgr: &impl MatTraitConst, border_threshold: u8) -> Result<Rect
         })
         .ok_or(anyhow!("minimap detection failed"))?;
 
-    debug!(target: "minimap", "yolo detection: {pred:?}");
+    debug!(target: "backend/minimap", "yolo detection: {pred:?}");
 
     // Extract the thresholded minimap
     let minimap_bbox = remap_from_yolo(pred, size, w_ratio, h_ratio, left, top);
@@ -1041,7 +1113,7 @@ fn detect_minimap(bgr: &impl MatTraitConst, border_threshold: u8) -> Result<Rect
     let left = scan_border(&minimap, Border::Left, border_threshold.saturating_sub(10));
     let right = scan_border(&minimap, Border::Right, border_threshold);
 
-    debug!(target: "minimap", "crop white border left {left}, top {top}, bottom {bottom}, right {right}");
+    debug!(target: "backend/minimap", "crop white border left {left}, top {top}, bottom {bottom}, right {right}");
 
     let bbox = Rect::new(
         left,
@@ -1049,93 +1121,9 @@ fn detect_minimap(bgr: &impl MatTraitConst, border_threshold: u8) -> Result<Rect
         minimap.cols() - right - left,
         minimap.rows() - bottom - top,
     );
-    debug!(target: "minimap", "bbox {bbox:?}");
+    debug!(target: "backend/minimap", "bbox {bbox:?}");
 
     Ok(bbox + contour_bbox.tl())
-}
-
-fn detect_minimap_name(grayscale: &impl MatTraitConst, minimap: Rect) -> Result<Rect> {
-    /// Top offset backward from the `y` of `minimap`.
-    const TOP_OFFSET: i32 = 24;
-    /// Left offset from the `x` of `minimap`.
-    const LEFT_OFFSET: i32 = 36;
-    /// The height of the name region.
-    const NAME_HEIGHT: i32 = 20;
-
-    let x = minimap.x + LEFT_OFFSET;
-    let y = minimap.y - TOP_OFFSET;
-    let kernel = get_structuring_element_def(MORPH_RECT, Size::new(5, 5)).unwrap();
-    let name_bbox = Rect::new(x, y, minimap.x + minimap.width - x, NAME_HEIGHT);
-    let mut name = grayscale.roi(name_bbox)?.clone_pointee();
-    unsafe {
-        name.modify_inplace(|mat, mat_mut| {
-            threshold(mat, mat_mut, 200.0, 255.0, THRESH_BINARY).unwrap();
-            dilate_def(mat, mat_mut, &kernel).unwrap();
-        });
-    }
-
-    let mut contours = Vector::<Vector<Point>>::new();
-    find_contours_def(&name, &mut contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE).unwrap();
-    if contours.is_empty() {
-        bail!("cannot find the minimap name contours")
-    }
-    let contour_bbox = contours
-        .into_iter()
-        .map(|contour| bounding_rect(&contour).unwrap())
-        .reduce(|first, second| first | second)
-        .ok_or(anyhow!("minimap name contours is empty"))?;
-    let name_bbox = contour_bbox + name_bbox.tl();
-
-    Ok(name_bbox)
-}
-
-fn detect_minimap_match<T: ToInputArray + MatTraitConst>(
-    bgra: &impl MatTraitConst,
-    grayscale: &impl MatTraitConst,
-    minimap_snapshot: &T,
-    minimap_snapshot_grayscale: bool,
-    minimap_name_snapshot: &T,
-    minimap_bbox: Rect,
-    minimap_name_bbox: Rect,
-) -> Result<f64> {
-    const EXPAND_BBOX_SIZE: i32 = 4;
-
-    let minimap_name_bbox = expand_bbox(
-        Some(grayscale.size().expect("size available")),
-        minimap_name_bbox,
-        EXPAND_BBOX_SIZE,
-    );
-    let minimap_name = grayscale.roi(minimap_name_bbox)?;
-
-    let minimap_bbox = expand_bbox(
-        Some(bgra.size().expect("size available")),
-        minimap_bbox,
-        EXPAND_BBOX_SIZE,
-    );
-    let minimap = if minimap_snapshot_grayscale {
-        to_grayscale(&bgra.roi(minimap_bbox)?, false)
-    } else {
-        bgra.roi(minimap_bbox)?.clone_pointee()
-    };
-
-    let name_score = detect_template_single(
-        &minimap_name,
-        minimap_name_snapshot,
-        no_array(),
-        Point::default(),
-        0.8,
-    )
-    .map(|(_, score)| score)?;
-    let minimap_score = detect_template_single(
-        &minimap,
-        minimap_snapshot,
-        no_array(),
-        Point::default(),
-        0.6,
-    )
-    .map(|(_, score)| score)?;
-
-    Ok((name_score + minimap_score) / 2.0)
 }
 
 fn detect_minimap_portals<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Vec<Rect> {
@@ -1530,6 +1518,13 @@ fn detect_player_buff<T: MatTraitConst + ToInputArray>(mat: &T, kind: BuffKind) 
         )
         .unwrap()
     });
+    static MVP_BONUS_EXP_COUPON_BUFF: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MVP_BONUS_EXP_COUPON_BUFF_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
     static LEGION_WEALTH_BUFF: LazyLock<Mat> = LazyLock::new(|| {
         imgcodecs::imdecode(
             include_bytes!(env!("LEGION_WEALTH_BUFF_TEMPLATE")),
@@ -1669,6 +1664,7 @@ fn detect_player_buff<T: MatTraitConst + ToInputArray>(mat: &T, kind: BuffKind) 
         | BuffKind::ExpCouponX3
         | BuffKind::ExpCouponX4
         | BuffKind::BonusExpCoupon
+        | BuffKind::MvpBonusExpCoupon
         | BuffKind::ForTheGuild
         | BuffKind::HardHitter
         | BuffKind::ExtremeRedPotion
@@ -1685,6 +1681,7 @@ fn detect_player_buff<T: MatTraitConst + ToInputArray>(mat: &T, kind: BuffKind) 
         BuffKind::ExpCouponX3 => &*EXP_COUPON_X3_BUFF,
         BuffKind::ExpCouponX4 => &*EXP_COUPON_X4_BUFF,
         BuffKind::BonusExpCoupon => &*BONUS_EXP_COUPON_BUFF,
+        BuffKind::MvpBonusExpCoupon => &*MVP_BONUS_EXP_COUPON_BUFF,
         BuffKind::LegionWealth => &*LEGION_WEALTH_BUFF,
         BuffKind::LegionLuck => &*LEGION_LUCK_BUFF,
         BuffKind::WealthAcquisitionPotion => &*WEALTH_ACQUISITION_POTION_BUFF,
@@ -1945,7 +1942,7 @@ fn detect_rune_spin_arrow(bgr: &impl MatTraitConst, spin_arrow: &mut SpinArrow) 
     // https://stackoverflow.com/a/13221874
     let dot = prev_arrow_head.x * -cur_arrow_head.y + prev_arrow_head.y * cur_arrow_head.x;
     if dot >= SPIN_LAG_THRESHOLD {
-        debug!(target: "rune", "spinning arrow lag detected");
+        debug!(target: "backend/rune", "spinning arrow lag detected");
         let directions = [
             (KeyKind::Up, prev_arrow_head.dot(Point::new(0, -1))),
             (KeyKind::Down, prev_arrow_head.dot(Point::new(0, 1))),
@@ -1956,7 +1953,7 @@ fn detect_rune_spin_arrow(bgr: &impl MatTraitConst, spin_arrow: &mut SpinArrow) 
             .into_iter()
             .max_by_key(|(_, score)| *score)
             .unwrap();
-        info!(target: "rune", "spinning arrow result {arrow:?} {directions:?}");
+        info!(target: "backend/rune", "spinning arrow result {arrow:?} {directions:?}");
         spin_arrow.final_arrow = Some(arrow);
     }
     #[cfg(debug_assertions)]
@@ -2261,14 +2258,6 @@ fn detect_change_channel_menu_opened(
     .is_ok()
 }
 
-fn detect_chat_menu_opened(grayscale: &impl ToInputArray) -> bool {
-    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(include_bytes!(env!("CHAT_MENU_TEMPLATE")), IMREAD_GRAYSCALE).unwrap()
-    });
-
-    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75).is_ok()
-}
-
 fn detect_admin_visible(grayscale: &impl ToInputArray) -> bool {
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
         imgcodecs::imdecode(include_bytes!(env!("ADMIN_TEMPLATE")), IMREAD_GRAYSCALE).unwrap()
@@ -2296,18 +2285,74 @@ fn detect_timer_visible(grayscale: &impl ToInputArray, localization: &Localizati
     .is_ok()
 }
 
-fn detect_lie_detector(bgr: &impl ToInputArray) -> Result<Rect> {
+pub static LIE_DETECTOR_TRANSPARENT_SHAPE_TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+    imgcodecs::imdecode(
+        include_bytes!(env!("LIE_DETECTOR_NEW_TEMPLATE")),
+        IMREAD_COLOR,
+    )
+    .unwrap()
+});
+
+fn detect_lie_detector_shape(bgr: &impl ToInputArray, localization: &Localization) -> Result<Rect> {
+    let template = localization
+        .lie_detector_new_base64
+        .as_ref()
+        .and_then(|base64| to_mat_from_base64(base64, false).ok());
+
+    detect_template(
+        bgr,
+        template
+            .as_ref()
+            .unwrap_or(&*LIE_DETECTOR_TRANSPARENT_SHAPE_TEMPLATE),
+        Point::default(),
+        0.6,
+    )
+}
+
+fn detect_lie_detector_shape_preparing(bgr: &impl ToInputArray) -> Result<Rect> {
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(include_bytes!(env!("LIE_DETECTOR_TEMPLATE")), IMREAD_COLOR).unwrap()
+        imgcodecs::imdecode(
+            include_bytes!(env!("LIE_DETECTOR_SHAPE_PREPARE_TEMPLATE")),
+            IMREAD_COLOR,
+        )
+        .unwrap()
     });
 
     detect_template(bgr, &*TEMPLATE, Point::default(), 0.6)
 }
 
-fn detect_lie_detector_preparing(bgr: &impl ToInputArray) -> Result<Rect> {
+pub static LIE_DETECTOR_VIOLETTA_TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+    imgcodecs::imdecode(
+        include_bytes!(env!("LIE_DETECTOR_OLD_TEMPLATE")),
+        IMREAD_COLOR,
+    )
+    .unwrap()
+});
+
+fn detect_lie_detector_violetta(
+    bgr: &impl ToInputArray,
+    localization: &Localization,
+) -> Result<Rect> {
+    let template = localization
+        .lie_detector_old_base64
+        .as_ref()
+        .and_then(|base64| to_mat_from_base64(base64, false).ok());
+
+    detect_template(
+        bgr,
+        template
+            .as_ref()
+            .unwrap_or(&*LIE_DETECTOR_VIOLETTA_TEMPLATE),
+        Point::default(),
+        0.6,
+    )
+}
+
+#[allow(unused)]
+fn detect_lie_detector_violetta_preparing(bgr: &impl ToInputArray) -> Result<Rect> {
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
         imgcodecs::imdecode(
-            include_bytes!(env!("LIE_DETECTOR_PREPARE_TEMPLATE")),
+            include_bytes!(env!("LIE_DETECTOR_VIOLETTA_PREPARE_TEMPLATE")),
             IMREAD_COLOR,
         )
         .unwrap()
@@ -2553,12 +2598,12 @@ fn detect_hexa_sol_erda(grayscale: &impl ToInputArray) -> Result<SolErda> {
 
     if detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75).is_ok() {
         return Ok(SolErda::AtLeastOne);
-    };
+    }
 
     bail!("sol erda tracker menu not visible")
 }
 
-fn detect_transparent_shapes(bgr: &impl MatTraitConst) -> Vec<Rect> {
+fn detect_transparent_shapes(bgr: &impl MatTraitConst) -> Vec<(Rect, f32)> {
     static MODEL: LazyLock<Mutex<Session>> = LazyLock::new(|| {
         Mutex::new(
             build_session(include_bytes!(env!("TRANSPARENT_SHAPE_MODEL")))
@@ -2575,9 +2620,81 @@ fn detect_transparent_shapes(bgr: &impl MatTraitConst) -> Vec<Rect> {
     (0..mat_out.rows())
         // SAFETY: 0..result.rows() is within Mat bounds
         .map(|i| unsafe { mat_out.at_row_unchecked::<f32>(i).unwrap() })
-        .filter(|pred| pred[4] >= 0.1)
-        .map(|pred| remap_from_yolo(pred, size, w_ratio, h_ratio, left, top))
+        .map(|pred| {
+            (
+                remap_from_yolo(pred, size, w_ratio, h_ratio, left, top),
+                pred[4],
+            )
+        })
         .collect()
+}
+
+fn detect_violetta_mushrooms(bgr: &impl MatTraitConst) -> Vec<(Rect, f32)> {
+    static MODEL: LazyLock<Mutex<Session>> = LazyLock::new(|| {
+        Mutex::new(
+            build_session(include_bytes!(env!("VIOLETTA_MODEL")))
+                .expect("build violetta detection session successfully"),
+        )
+    });
+
+    let size = bgr.size().unwrap();
+    let (mat_in, w_ratio, h_ratio, left, top) = preprocess_for_yolo(bgr);
+    let mut model = MODEL.lock().unwrap();
+    let result = model.run([to_input_value(&mat_in)]).unwrap();
+    let mat_out = from_output_value(&result);
+
+    (0..mat_out.rows())
+        // SAFETY: 0..result.rows() is within Mat bounds
+        .map(|i| unsafe { mat_out.at_row_unchecked::<f32>(i).unwrap() })
+        .map(|pred| {
+            (
+                remap_from_yolo(pred, size, w_ratio, h_ratio, left, top),
+                pred[4],
+            )
+        })
+        .collect()
+}
+
+fn detect_violetta_face(bgr: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("LIE_DETECTOR_VIOLETTA_FACE_TEMPLATE")),
+            IMREAD_COLOR,
+        )
+        .unwrap()
+    });
+
+    detect_template(bgr, &*TEMPLATE, Point::default(), 0.6)
+}
+
+fn detect_violetta_numbers(bgr: &impl ToInputArray) -> Vec<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("LIE_DETECTOR_VIOLETTA_NUMBER_TEMPLATE")),
+            IMREAD_COLOR,
+        )
+        .unwrap()
+    });
+
+    static TEMPLATE_MASK: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("LIE_DETECTOR_VIOLETTA_NUMBER_MASK_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    let mut vec =
+        detect_template_multiple(bgr, &*TEMPLATE, &*TEMPLATE_MASK, Point::default(), 4, 0.75)
+            .into_iter()
+            .filter_map(|result| Some(result.ok()?.0))
+            .collect::<Vec<Rect>>();
+    if vec.is_empty() || vec.len() != 4 {
+        return vec![];
+    }
+
+    vec.sort_by_key(|rect| rect.x);
+    vec
 }
 
 /// Detects a single match from `template` with the given BGR image `Mat`.
@@ -2669,7 +2786,7 @@ fn detect_template_multiple<T: ToInputArray + MatTraitConst>(
 
     let mut result = Mat::default();
     if let Err(err) = match_template(mat, template, &mut result, TM_CCOEFF_NORMED, &mask) {
-        error!(target: "detect", "template detection error {err}");
+        error!(target: "backend/detect", "template detection error {err}");
         return vec![];
     }
 
@@ -2700,47 +2817,61 @@ fn detect_template_multiple<T: ToInputArray + MatTraitConst>(
     matches
 }
 
-/// Extracts texts from the non-preprocessed `Mat` and detected text bounding boxes.
+/// Extracts texts from the non-preprocessed BGR `Mat` and detected text bounding boxes.
 fn extract_texts(mat: &impl MatTraitConst, bboxes: &[Rect]) -> Vec<String> {
-    static TEXT_RECOGNITION_MODEL: LazyLock<Mutex<TextRecognitionModel>> = LazyLock::new(|| {
-        let model = read_net_from_onnx_buffer(&Vector::from_slice(include_bytes!(env!(
-            "TEXT_RECOGNITION_MODEL"
-        ))))
-        .unwrap();
+    static MODEL: LazyLock<Mutex<Session>> = LazyLock::new(|| {
         Mutex::new(
-            TextRecognitionModel::new(&model)
-                .and_then(|mut m| {
-                    m.set_input_params(
-                        1.0 / 127.5,
-                        Size::new(100, 32),
-                        Scalar::new(127.5, 127.5, 127.5, 0.0),
-                        false,
-                        false,
-                    )?;
-                    m.set_decode_type("CTC-greedy")?.set_vocabulary(
-                        &include_str!(env!("TEXT_RECOGNITION_ALPHABET"))
-                            .lines()
-                            .collect::<Vector<String>>(),
-                    )
-                })
-                .expect("build text recognition model successfully"),
+            build_session(include_bytes!(env!("TEXT_RECOGNITION_MODEL")))
+                .expect("build text recognition session normally"),
         )
     });
 
-    let recognizier = TEXT_RECOGNITION_MODEL.lock().unwrap();
+    static ALPHABET: LazyLock<String> = LazyLock::new(|| {
+        include_str!(env!("TEXT_RECOGNITION_ALPHABET"))
+            .split("\n")
+            .collect()
+    });
+
+    fn ctc_greedy_decode(mat: Mat) -> String {
+        let mut result = String::new();
+        let blank_class = 0usize;
+        let mut prev_class = blank_class;
+
+        for timestep in 0..mat.rows() {
+            let logits = mat.row(timestep).unwrap();
+            let class = logits
+                .iter::<f32>()
+                .unwrap()
+                .enumerate()
+                .max_by(|(_, (_, first)), (_, (_, second))| first.partial_cmp(second).unwrap())
+                .map(|(class, _)| class)
+                .unwrap();
+
+            if class != blank_class && class != prev_class {
+                result.push(ALPHABET.chars().nth(class - 1).unwrap());
+            }
+
+            prev_class = class;
+        }
+
+        result
+    }
+
+    let mut model = MODEL.lock().unwrap();
+
     bboxes
         .iter()
-        .copied()
-        .filter_map(|word| {
-            let mut mat = mat.roi(word).unwrap().clone_pointee();
-            unsafe {
-                mat.modify_inplace(|mat, mat_mut| {
-                    cvt_color_def(mat, mat_mut, COLOR_BGR2RGB).unwrap();
-                });
-            }
-            recognizier.recognize(&mat).ok()
+        .filter_map(|&bbox| {
+            let roi = mat.roi(bbox).ok()?;
+            let input = preprocess_for_text(&roi);
+            Some(to_input_value(&input))
         })
-        .collect()
+        .map(|input| {
+            let result = model.run([input]).unwrap();
+            let mat = from_output_value_with_batch_index(&result, 1);
+            ctc_greedy_decode(mat)
+        })
+        .collect::<Vec<_>>()
 }
 
 /// Extracts text bounding boxes from the preprocessed [`Mat`].
@@ -2988,20 +3119,29 @@ fn preprocess_for_yolo(mat: &impl MatTraitConst) -> (Mat, f32, f32, i32, i32) {
     (mat, min_ratio, min_ratio, left, top)
 }
 
+/// Preprocesses a BGR `Mat` image for text bounding boxes detection with `5.0` magnification ratio.
+/// This function is meant for small images.
+#[inline]
+fn preprocess_for_text_bboxes(bgr: &impl MatTraitConst) -> (Mat, f32, f32) {
+    preprocess_for_text_bboxes_magnified(bgr, 5.0)
+}
+
 /// Preprocesses a BGR `Mat` image to a normalized and resized RGB `Mat` image with type `f32`
 /// for text bounding boxes detection.
 ///
 /// The preprocess is adapted from: https://github.com/clovaai/CRAFT-pytorch/blob/master/imgproc.py
 ///
 /// Returns a `(Mat, width_ratio, height_ratio)`.
-#[inline]
-fn preprocess_for_text_bboxes(mat: &impl MatTraitConst) -> (Mat, f32, f32) {
-    let mut mat = mat.try_clone().unwrap();
+fn preprocess_for_text_bboxes_magnified(
+    bgr: &impl MatTraitConst,
+    magnification_ratio: f32,
+) -> (Mat, f32, f32) {
+    let mut mat = bgr.try_clone().unwrap();
     let size = mat.size().unwrap();
     let size_w = size.width as f32;
     let size_h = size.height as f32;
     let size_max = size_w.max(size_h);
-    let resize_size = 5.0 * size_max;
+    let resize_size = magnification_ratio * size_max;
     let resize_ratio = resize_size / size_max;
 
     let resize_w = (resize_ratio * size_w) as i32;
@@ -3031,6 +3171,24 @@ fn preprocess_for_text_bboxes(mat: &impl MatTraitConst) -> (Mat, f32, f32) {
         });
     }
     (mat, resize_w_ratio, resize_h_ratio)
+}
+
+/// Preprocesses a BGR `Mat` image to a normalized and resized RGB `Mat` image with type `f32`
+/// for CRNN+CTC text recognition.
+fn preprocess_for_text(bgr: &impl MatTraitConst) -> Mat {
+    let mut mat = bgr.try_clone().unwrap();
+
+    unsafe {
+        mat.modify_inplace(|mat, mat_mut| {
+            cvt_color_def(mat, mat_mut, COLOR_BGR2RGB).unwrap();
+            resize(mat, mat_mut, Size::new(100, 32), 0.0, 0.0, INTER_LINEAR).unwrap();
+            mat.convert_to(mat_mut, CV_32FC3, 1.0, 0.0).unwrap();
+            subtract_def(&mat, &Scalar::all(127.5), mat_mut).unwrap();
+            divide2_def(&mat, &Scalar::all(127.5), mat_mut).unwrap();
+        });
+    }
+
+    mat
 }
 
 /// Expands `bbox` in all the direction by `count` pixel(s) and clamps to `size` if provided.
@@ -3153,15 +3311,32 @@ pub fn to_base64_from_mat(mat: &Mat) -> Result<String> {
     Ok(BASE64_STANDARD.encode(bytes))
 }
 
-/// Extracts a borrowed `Mat` from `SessionOutputs`.
+/// Extracts a `Mat` from `SessionOutputs` assuming batch index is 0.
 ///
-/// The returned `Mat` has shape `[..dims]` with batch size (1) removed.
+/// The returned `Mat` has batch dimension removed.
 #[inline]
 fn from_output_value(result: &SessionOutputs) -> Mat {
-    let (dims, outputs) = result["output0"].try_extract_tensor::<f32>().unwrap();
+    from_output_value_with_batch_index(result, 0)
+}
+
+/// Extracts a `Mat` from `SessionOutputs` and `batch_index`.
+///
+/// The returned `Mat` has batch dimension removed.
+#[inline]
+fn from_output_value_with_batch_index(result: &SessionOutputs, batch_index: usize) -> Mat {
+    let key = result.keys().next().unwrap();
+    let (dims, outputs) = result[key].try_extract_tensor::<f32>().unwrap();
+
     let dims = dims.iter().map(|&dim| dim as i32).collect::<Vec<i32>>();
     let mat = Mat::new_nd_with_data(dims.as_slice(), outputs).unwrap();
-    let mat = mat.reshape_nd(1, &dims.as_slice()[1..]).unwrap();
+
+    let new_dims = dims
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &dim)| if i == batch_index { None } else { Some(dim) })
+        .collect::<Vec<i32>>();
+    let mat = mat.reshape_nd(1, &new_dims).unwrap();
+
     mat.clone_pointee()
 }
 
@@ -3171,7 +3346,7 @@ fn from_output_value(result: &SessionOutputs) -> Mat {
 /// will panic if not. The `Mat` is reshaped to single channel, tranposed to `[1, 3, H, W]` and
 /// converted to `SessionInputValue`.
 #[inline]
-fn to_input_value(mat: &impl MatTraitConst) -> SessionInputValue<'_> {
+fn to_input_value(mat: &impl MatTraitConst) -> SessionInputValue<'static> {
     let mat = mat.reshape_nd(1, &[1, mat.rows(), mat.cols(), 3]).unwrap();
     let mut mat_t = Mat::default();
     transpose_nd(&mat, &Vector::from_slice(&[0, 3, 1, 2]), &mut mat_t).unwrap();

@@ -12,10 +12,7 @@ use opencv::{
     highgui::destroy_all_windows,
     imgcodecs::{IMREAD_COLOR, imdecode},
     imgproc::{COLOR_BGR2BGRA, cvt_color_def},
-    videoio::{
-        CAP_PROP_FPS, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst, VideoWriter,
-        VideoWriterTrait,
-    },
+    videoio::{VideoCapture, VideoCaptureTrait, VideoWriter, VideoWriterTrait},
 };
 use platforms::Window;
 use rand::distr::SampleString;
@@ -36,8 +33,7 @@ use crate::{
     mat::OwnedMat,
     models::Localization,
     run::FPS,
-    solvers::{RuneSolver, TransparentShapeSolver},
-    tracker::ByteTracker,
+    solvers::{RuneSolver, TransparentShapeSolver, ViolettaSolver},
     utils::DatasetDir,
 };
 
@@ -57,7 +53,7 @@ impl Default for DebugService {
 }
 
 impl DebugService {
-    pub fn poll(&mut self, resources: &Resources) {
+    pub fn poll(&mut self, resources: &mut Resources) {
         if let Some(writer) = self.writer.as_mut()
             && let Some(detector) = resources.detector.as_ref()
         {
@@ -67,7 +63,8 @@ impl DebugService {
         if self.state.is_empty() {
             let _ = self.state.send(DebugState {
                 is_recording: self.writer.is_some(),
-                is_rune_auto_saving: resources.debug.auto_save_rune(),
+                is_rune_auto_saving: resources.debug.auto_save_rune,
+                is_lie_detector_auto_recording: resources.debug.auto_record_lie_detector,
             });
         }
     }
@@ -76,11 +73,7 @@ impl DebugService {
         self.state.subscribe()
     }
 
-    pub fn set_auto_save_rune(&self, resources: &Resources, auto_save: bool) {
-        resources.debug.set_auto_save_rune(auto_save);
-    }
-
-    pub fn record_video(&mut self, resources: &Resources, start: bool) {
+    pub fn record_video(&mut self, resources: &mut Resources, start: bool) {
         if !start {
             self.writer = None;
             return;
@@ -156,29 +149,58 @@ impl DebugService {
 
             let mut frame_rx = frame_receiver_from_video(file);
             let mut solver = TransparentShapeSolver::debug();
-            let mut tracker = ByteTracker::new(FPS);
             let localization = Arc::new(Localization::default());
 
             input.set_window(Window::new("Main HighGUI"));
 
-            loop_with_fps(FPS, || {
+            loop {
                 if frame_rx.is_closed() {
-                    return false;
+                    return;
                 }
 
                 if let Ok(frame) = frame_rx.try_recv() {
                     let region = Rect::new(0, 0, frame.cols(), frame.rows());
                     let detector =
                         DefaultDetector::new(OwnedMat::from(frame), localization.clone());
-                    let cursor = solver.solve(&detector, &mut tracker, region);
+                    let cursor = solver.solve(&detector, region);
 
                     if let Some(cursor) = cursor {
                         input.send_mouse(cursor.x, cursor.y, MouseKind::Move);
                     }
                 }
+            }
+        });
+    }
 
-                true
-            });
+    pub fn test_violetta(&self, mut input: Box<dyn Input>) {
+        static VIDEO: &[u8] = include_bytes!(env!("VIOLETTA_TEST_VIDEO"));
+
+        spawn_blocking(move || {
+            let file = DatasetDir::Root.to_folder().join("violetta_test.mp4");
+            if !file.exists() {
+                let _ = fs::write(&file, VIDEO);
+            }
+
+            let mut frame_rx = frame_receiver_from_video(file);
+            let mut solver = ViolettaSolver::debug();
+            let localization = Arc::new(Localization::default());
+
+            input.set_window(Window::new("Main HighGUI"));
+
+            loop {
+                if frame_rx.is_closed() {
+                    return;
+                }
+
+                if let Ok(frame) = frame_rx.try_recv() {
+                    let region = Rect::new(0, 0, frame.cols(), frame.rows());
+                    let detector =
+                        DefaultDetector::new(OwnedMat::from(frame), localization.clone());
+                    if let Some(cursor) = solver.solve(&detector, region) {
+                        input.send_mouse(cursor.x, cursor.y, MouseKind::Move);
+                    }
+                }
+            }
         });
     }
 }
@@ -196,13 +218,12 @@ fn frame_receiver_from_video(file: PathBuf) -> mpsc::Receiver<Mat> {
         true
     }
 
-    let (tx, rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel(3);
     let mut capture = VideoCapture::from_file_def(file.to_str().expect("invalid UTF-8 path"))
         .expect("failed to open video");
-    let fps = capture.get(CAP_PROP_FPS).expect("failed to read FPS") as u32;
 
     spawn_blocking(move || {
-        loop_with_fps(fps, || read_and_send_frame(&mut capture, &tx));
+        loop_with_fps(FPS, || read_and_send_frame(&mut capture, &tx));
     });
 
     rx

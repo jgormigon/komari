@@ -14,8 +14,8 @@ use tokio::{
 };
 
 use crate::{
-    BoundQuadrant, Character, DetectionTemplate, KeyBinding, NavigationPath, Operation,
-    OperationUpdate, Request, Response, State,
+    BoundQuadrant, Character, DetectionTemplate, KeyBinding, Operation, OperationUpdate, Request,
+    Response, State,
     detect::to_base64_from_mat,
     ecs::{Resources, World},
     minimap::Minimap,
@@ -35,8 +35,6 @@ pub enum MediatorEvent {
         request: Request,
         response: oneshot::Sender<Response>,
     },
-    UpdateMap(Option<String>, Option<Map>),
-    UpdateCharacter(Option<Character>),
 }
 
 impl Event for MediatorEvent {}
@@ -45,35 +43,26 @@ impl Event for MediatorEvent {}
 pub trait MediatorService: Debug {
     fn subscribe_state(&self) -> broadcast::Receiver<State>;
 
-    fn broadcast_state(&self, resources: &Resources, world: &World, map: Option<&Map>);
-
-    /// Queues a [`MediatorEvent::UpdateCharacter`].
-    fn queue_update_character(&self, character: Option<Character>);
-
-    /// Queues a [`MediatorEvent::UpdateMap`].
-    fn queue_update_map(&self, preset: Option<String>, map: Option<Map>);
+    fn broadcast_state(&self, resources: &mut Resources, world: &World);
 }
 
 #[derive(Debug)]
 pub struct DefaultMediatorService {
-    event_tx: mpsc::UnboundedSender<MediatorEvent>,
     state_tx: broadcast::Sender<State>,
 }
 
 impl DefaultMediatorService {
     pub fn new() -> (Self, mpsc::UnboundedReceiver<MediatorEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let event_tx_clone = event_tx.clone();
         spawn(async move {
             loop {
                 if let Some((request, response)) = recv_request().await {
-                    let _ = event_tx_clone.send(MediatorEvent::Ui { request, response });
+                    let _ = event_tx.send(MediatorEvent::Ui { request, response });
                 }
             }
         });
 
         let service = Self {
-            event_tx,
             state_tx: broadcast::channel(1).0,
         };
         (service, event_rx)
@@ -85,7 +74,7 @@ impl MediatorService for DefaultMediatorService {
         self.state_tx.subscribe()
     }
 
-    fn broadcast_state(&self, resources: &Resources, world: &World, map: Option<&Map>) {
+    fn broadcast_state(&self, resources: &mut Resources, world: &World) {
         if !self.state_tx.is_empty() {
             return;
         }
@@ -112,16 +101,11 @@ impl MediatorService for DefaultMediatorService {
             Minimap::Detecting => None,
         };
 
-        let platforms_bound = idle
-            .zip(map.filter(|map| map.auto_mob_platforms_bound))
-            .and_then(|(idle, _)| idle.platforms_bound.map(Into::into));
-
         let portals = idle
             .map(|idle| idle.portals().into_iter().map(Into::into).collect())
             .unwrap_or_default();
 
         let operation = match resources.operation.state {
-            OperationState::HaltUntil { instant, .. } => Operation::HaltUntil(instant),
             OperationState::TemporaryHalting { resume, .. } => Operation::TemporaryHalting(resume),
             OperationState::Halting => Operation::Halting,
             OperationState::Running => Operation::Running,
@@ -160,23 +144,12 @@ impl MediatorService for DefaultMediatorService {
                 destinations,
                 operation,
                 frame,
-                platforms_bound,
                 portals,
                 auto_mob_quadrant,
             };
 
             let _ = sender.send(state);
         });
-    }
-
-    fn queue_update_character(&self, character: Option<Character>) {
-        let _ = self
-            .event_tx
-            .send(MediatorEvent::UpdateCharacter(character));
-    }
-
-    fn queue_update_map(&self, preset: Option<String>, map: Option<Map>) {
-        let _ = self.event_tx.send(MediatorEvent::UpdateMap(preset, map));
     }
 }
 
@@ -188,8 +161,6 @@ impl EventHandler<MediatorEvent> for MediatorEventHandler {
             MediatorEvent::Ui { request, response } => {
                 handle_ui_request(context, request, response)
             }
-            MediatorEvent::UpdateMap(preset, map) => update_map(context, preset, map),
-            MediatorEvent::UpdateCharacter(character) => update_character(context, character),
         }
     }
 }
@@ -205,19 +176,10 @@ fn handle_ui_request(
             Response::UpdateOperation
         }
         Request::CreateMap(name) => Response::CreateMap(create_map(context, name)),
-        Request::UpdateMap(preset, map) => {
-            update_map(context, preset, map);
+        Request::UpdateMap(map, preset) => {
+            update_map(context, map, preset);
             Response::UpdateMap
         }
-        Request::CreateNavigationPath => {
-            Response::CreateNavigationPath(create_navigation_path(context))
-        }
-        Request::RecaptureNavigationPath(path) => {
-            Response::RecaptureNavigationPath(recapture_navigation_path(context, path))
-        }
-        Request::NavigationSnapshotAsGrayscale(base64) => Response::NavigationSnapshotAsGrayscale(
-            convert_navigation_path_snapshot_to_grayscale(context, base64),
-        ),
         Request::UpdateCharacter(character) => {
             update_character(context, character);
             Response::UpdateCharacter
@@ -253,8 +215,13 @@ fn handle_ui_request(
         Request::DebugStateReceiver => Response::DebugStateReceiver(subscribe_debug_state(context)),
         #[cfg(debug_assertions)]
         Request::AutoSaveRune(auto_save) => {
-            update_auto_save_rune(context, auto_save);
+            context.resources.debug.auto_save_rune = auto_save;
             Response::AutoSaveRune
+        }
+        #[cfg(debug_assertions)]
+        Request::AutoRecordLieDetector(auto_record) => {
+            context.resources.debug.auto_record_lie_detector = auto_record;
+            Response::AutoRecordLieDetector
         }
         #[cfg(debug_assertions)]
         Request::RecordVideo(start) => {
@@ -265,6 +232,13 @@ fn handle_ui_request(
         Request::TestSpinRune => {
             test_spin_rune(context);
             Response::TestSpinRune
+        }
+        #[cfg(debug_assertions)]
+        Request::TestVioletta => {
+            context
+                .debug_service
+                .test_violetta(context.resources.input.clone());
+            Response::TestVioletta
         }
         #[cfg(debug_assertions)]
         Request::TestTransparentShape(difficulty) => {
@@ -288,7 +262,7 @@ fn create_map(context: &mut EventContext<'_>, name: String) -> Option<Map> {
         .create(context.world.minimap.state, name)
 }
 
-fn update_map(context: &mut EventContext<'_>, preset: Option<String>, map: Option<Map>) {
+fn update_map(context: &mut EventContext<'_>, map: Option<Map>, preset: Option<String>) {
     let world = &mut context.world;
     let map_service = &mut context.map_service;
     map_service.update_map_preset(map, preset);
@@ -299,39 +273,10 @@ fn update_map(context: &mut EventContext<'_>, preset: Option<String>, map: Optio
     let preset = map_service.preset();
     rotator_service.update_from_map(map, preset);
     rotator_service.apply(context.rotator);
-
-    context
-        .navigator
-        .mark_dirty_with_destination(map.and_then(|map| map.paths_id_index));
 }
 
 fn redetect_map_minimap(context: &mut EventContext<'_>) {
     context.map_service.redetect(&mut context.world.minimap);
-    context.navigator.mark_dirty(true);
-}
-
-fn create_navigation_path(context: &mut EventContext<'_>) -> Option<NavigationPath> {
-    context
-        .navigator_service
-        .create_path(context.resources, context.world.minimap.state)
-}
-
-fn recapture_navigation_path(
-    context: &mut EventContext<'_>,
-    path: NavigationPath,
-) -> NavigationPath {
-    context
-        .navigator_service
-        .recapture_path(context.resources, context.world.minimap.state, path)
-}
-
-fn convert_navigation_path_snapshot_to_grayscale(
-    context: &mut EventContext<'_>,
-    base64: String,
-) -> String {
-    context
-        .navigator_service
-        .navigation_snapshot_as_grayscale(base64)
 }
 
 fn update_character(context: &mut EventContext<'_>, character: Option<Character>) {
@@ -407,13 +352,6 @@ fn save_capture_image(context: &mut EventContext<'_>, is_grayscale: bool) {
 #[cfg(debug_assertions)]
 fn subscribe_debug_state(context: &mut EventContext<'_>) -> broadcast::Receiver<DebugState> {
     context.debug_service.subscribe_state()
-}
-
-#[cfg(debug_assertions)]
-fn update_auto_save_rune(context: &mut EventContext<'_>, auto_save: bool) {
-    context
-        .debug_service
-        .set_auto_save_rune(context.resources, auto_save);
 }
 
 #[cfg(debug_assertions)]

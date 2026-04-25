@@ -25,8 +25,7 @@ use crate::{
     ecs::{Resources, World, WorldEvent},
     mat::OwnedMat,
     minimap::{self, Minimap, MinimapContext, MinimapEntity},
-    navigator::{DefaultNavigator, Navigator},
-    notification::DiscordNotification,
+    notification::Notification,
     operation::{Operation, OperationConfiguration, OperationState},
     player::{self, Player, PlayerContext, PlayerEntity},
     rng::Rng,
@@ -80,7 +79,7 @@ fn systems_loop() {
     let localization = Rc::new(RefCell::new(Arc::new(query_or_upsert_localization())));
     let seeds = query_and_upsert_seeds();
     let rng = Rng::new(seeds.rng_seed, seeds.perlin_seed);
-    let (event_tx, event_rx) = channel::<WorldEvent>(5);
+    let (event_tx, _) = channel::<WorldEvent>(5);
 
     let mut service = Services::new(settings.clone(), localization.clone(), event_tx.subscribe());
     let window = service.selected_window();
@@ -89,8 +88,7 @@ fn systems_loop() {
     service.update_window(&mut input, &mut capture);
 
     let mut rotator = DefaultRotator::default();
-    let mut navigator = DefaultNavigator::new(event_rx);
-    let notification = DiscordNotification::new(settings.clone());
+    let notification = Notification::new(settings.clone());
     let mut resources = Resources {
         #[cfg(debug_assertions)]
         debug: Debug::default(),
@@ -140,10 +138,15 @@ fn systems_loop() {
     };
     let mut is_capturing_normally = false;
 
-    let mut lie_detector_event_task = event_task(
-        WorldEvent::LieDetectorAppeared,
+    let mut lie_detector_shape_event_task = event_task(
+        WorldEvent::LieDetectorShapeAppeared,
         event_tx.clone(),
-        |detector| detector.detect_lie_detector().is_ok(),
+        |detector| detector.detect_lie_detector_shape().is_ok(),
+    );
+    let mut lie_detector_violleta_event_task = event_task(
+        WorldEvent::LieDetectorViolettaAppeared,
+        event_tx.clone(),
+        |detector| detector.detect_lie_detector_violetta().is_ok(),
     );
     let mut elite_boss_event_task = event_task(
         WorldEvent::EliteBossAppeared,
@@ -169,37 +172,36 @@ fn systems_loop() {
         if let Ok(detector) = detector {
             let was_running_cycle =
                 matches!(resources.operation.state, OperationState::RunUntil { .. });
-            let was_stopping_cycle =
-                matches!(resources.operation.state, OperationState::HaltUntil { .. });
             let was_player_alive = !world.player.context.is_dead();
             let was_minimap_idle = matches!(world.minimap.state, Minimap::Idle(_));
 
             resources.detector = Some(Arc::new(detector));
             resources.operation.update_tick();
 
-            minimap::run_system(&resources, &mut world.minimap, world.player.state.clone());
-            player::run_system(&resources, &mut world.player, &world.minimap, &world.buffs);
+            minimap::run_system(
+                &mut resources,
+                &mut world.minimap,
+                world.player.state.clone(),
+            );
+            player::run_system(
+                &mut resources,
+                &mut world.player,
+                &world.minimap,
+                &world.buffs,
+            );
             for skill in world.skills.iter_mut() {
-                skill::run_system(&resources, skill, world.player.state.clone());
+                skill::run_system(&mut resources, skill, world.player.state.clone());
             }
             for buff in world.buffs.iter_mut() {
-                buff::run_system(&resources, buff, world.player.state.clone());
+                buff::run_system(&mut resources, buff, world.player.state.clone());
             }
 
-            if navigator.navigate_player(&resources, &mut world.player.context, world.minimap.state)
-            {
-                rotator.rotate_action(&resources, &mut world);
-            }
+            rotator.rotate_action(&mut resources, &mut world);
 
             let did_cycled_to_stop = resources.operation.halting();
-            let did_cycled_to_run =
-                matches!(resources.operation.state, OperationState::RunUntil { .. });
             // Go to town on stop cycle
             if was_running_cycle && did_cycled_to_stop {
-                let _ = event_tx.send(WorldEvent::CycledToHalt);
-            }
-            if was_stopping_cycle && did_cycled_to_run {
-                let _ = event_tx.send(WorldEvent::CycledToRun);
+                let _ = event_tx.send(WorldEvent::RunTimerEnded);
             }
 
             let player_died = was_player_alive && world.player.context.is_dead();
@@ -212,8 +214,9 @@ fn systems_loop() {
                 let _ = event_tx.send(WorldEvent::MinimapChanged);
             }
 
-            lie_detector_event_task(&resources);
-            elite_boss_event_task(&resources);
+            lie_detector_shape_event_task(&mut resources);
+            lie_detector_violleta_event_task(&mut resources);
+            elite_boss_event_task(&mut resources);
         }
 
         if was_capturing_normally && !is_capturing_normally {
@@ -225,13 +228,7 @@ fn systems_loop() {
             .notification
             .update(resources.detector.as_ref().map(|detector| detector.mat()));
 
-        service.poll(
-            &mut resources,
-            &mut world,
-            &mut rotator,
-            &mut navigator,
-            &mut capture,
-        );
+        service.poll(&mut resources, &mut world, &mut rotator, &mut capture);
     });
 }
 
@@ -286,7 +283,7 @@ fn loop_with_fps(fps: u32, mut on_tick: impl FnMut()) {
                 use log::debug;
 
                 last_logged_instant = now;
-                debug!(target: "context", "ticking running late at {}ms", elapsed_duration.as_millis());
+                debug!(target: "backend/context", "ticking running late at {}ms", elapsed_duration.as_millis());
             }
         }
     }

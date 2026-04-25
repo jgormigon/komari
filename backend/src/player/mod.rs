@@ -22,15 +22,15 @@ use use_key::{UseKey, update_use_key_state};
 use crate::{
     bridge::KeyKind,
     buff::BuffEntities,
-    ecs::{Resources, transition, transition_if},
+    ecs::Resources,
     minimap::{Minimap, MinimapEntity},
     models::ActionKeyDirection,
     player::{
-        chat::{Chatting, update_chatting_state},
         exchange_booster::{ExchangingBooster, update_exchanging_booster_state},
         fall::Falling,
         grapple::Grappling,
         solve_shape::{SolvingShape, update_solving_shape_state},
+        solve_violetta::{SolvingVioletta, update_solving_violetta_state},
         unstuck::Unstucking,
         use_booster::{UsingBooster, update_using_booster_state},
     },
@@ -39,7 +39,6 @@ use crate::{
 mod actions;
 mod adjust;
 mod cash_shop;
-mod chat;
 mod double_jump;
 mod exchange_booster;
 mod fall;
@@ -51,6 +50,7 @@ mod moving;
 mod panic;
 mod solve_rune;
 mod solve_shape;
+mod solve_violetta;
 mod stall;
 mod state;
 mod timeout;
@@ -61,7 +61,7 @@ mod use_key;
 
 pub use actions::*;
 pub use {
-    chat::ChattingContent, double_jump::DOUBLE_JUMP_THRESHOLD, grapple::GRAPPLING_MAX_THRESHOLD,
+    double_jump::DOUBLE_JUMP_THRESHOLD, grapple::GRAPPLING_MAX_THRESHOLD,
     grapple::GRAPPLING_THRESHOLD, panic::Panicking, state::PlayerContext, state::Quadrant,
 };
 
@@ -106,13 +106,15 @@ pub enum Player {
     /// Tries to solve a rune.
     SolvingRune(SolvingRune),
     /// Tries to solve lie detector's transparent shape.
+    #[strum(to_string = "SolvingShape({0})")]
     SolvingShape(SolvingShape),
+    #[strum(to_string = "SolvingVioletta({0})")]
+    SolvingVioletta(SolvingVioletta),
     /// Enters the cash shop then exit after 10 seconds.
     CashShopThenExit(CashShop),
     #[strum(to_string = "FamiliarsSwapping({0})")]
     FamiliarsSwapping(FamiliarsSwapping),
     Panicking(Panicking),
-    Chatting(Chatting),
     UsingBooster(UsingBooster),
     ExchangingBooster(ExchangingBooster),
 }
@@ -151,35 +153,32 @@ impl Player {
             | Player::DoubleJumping(DoubleJumping { forced: true, .. })
             | Player::UseKey(_)
             | Player::FamiliarsSwapping(_)
-            | Player::Chatting(_)
             | Player::Panicking(_)
             | Player::UsingBooster(_)
             | Player::ExchangingBooster(_)
             | Player::SolvingShape(_)
+            | Player::SolvingVioletta(_)
             | Player::Stalling(_, _) => false,
         }
     }
 }
 
 pub fn run_system(
-    resources: &Resources,
+    resources: &mut Resources,
     player: &mut PlayerEntity,
     minimap: &MinimapEntity,
     buffs: &BuffEntities,
 ) {
-    transition_if!(
-        player,
-        Player::CashShopThenExit(CashShop::new()),
-        player.context.rune_cash_shop,
-        {
-            resources.input.send_key_up(KeyKind::Up);
-            resources.input.send_key_up(KeyKind::Down);
-            resources.input.send_key_up(KeyKind::Left);
-            resources.input.send_key_up(KeyKind::Right);
-            player.context.rune_cash_shop = false;
-            player.context.reset_to_idle_next_update = false;
-        }
-    );
+    if player.context.rune_cash_shop {
+        resources.input.send_key_up(KeyKind::Up);
+        resources.input.send_key_up(KeyKind::Down);
+        resources.input.send_key_up(KeyKind::Left);
+        resources.input.send_key_up(KeyKind::Right);
+        player.context.rune_cash_shop = false;
+        player.context.reset_to_idle_next_update = false;
+        player.state = Player::CashShopThenExit(CashShop::new());
+        return;
+    }
 
     let did_update =
         player
@@ -193,30 +192,27 @@ pub fn run_system(
         // `update_non_positional_context` is here to continue updating
         // `Player::Unstucking` returned from below when the player
         // is inside the edges of the minimap. And also `Player::CashShopThenExit`.
-        transition_if!(update_non_positional_state(
-            resources,
-            player,
-            minimap.state,
-            true
-        ));
+        if update_non_positional_state(resources, player, minimap.state, true) {
+            return;
+        }
 
         let is_stucking = match minimap.state {
             Minimap::Detecting => false,
             Minimap::Idle(idle) => !idle.partially_overlapping,
         };
-        transition_if!(
-            player,
-            Player::Unstucking(Unstucking::new_movement(
+        if is_stucking {
+            let unstucking = Unstucking::new_movement(
                 Timeout::default(),
-                player.context.track_unstucking_transitioned()
-            )),
-            is_stucking,
-            {
-                player.context.last_known_direction = ActionKeyDirection::Any;
-            }
-        );
-        transition!(player, Player::Detecting);
-    };
+                player.context.track_unstucking_transitioned(),
+            );
+            player.state = Player::Unstucking(unstucking);
+            player.context.last_known_direction = ActionKeyDirection::Any;
+            return;
+        }
+
+        player.state = Player::Detecting;
+        return;
+    }
 
     if player.context.reset_to_idle_next_update {
         player.context.reset_to_idle_next_update = false;
@@ -237,7 +233,7 @@ pub fn run_system(
 /// Returns `true` if state is updated.
 #[inline]
 fn update_non_positional_state(
-    resources: &Resources,
+    resources: &mut Resources,
     player: &mut PlayerEntity,
     minimap_state: Minimap,
     failed_to_detect_player: bool,
@@ -265,13 +261,13 @@ fn update_non_positional_state(
             update_solving_rune_state(resources, player);
         }
         Player::SolvingShape(_) => update_solving_shape_state(resources, player),
+        Player::SolvingVioletta(_) => update_solving_violetta_state(resources, player),
         Player::CashShopThenExit(cash_shop) => {
             update_cash_shop_state(resources, player, cash_shop, failed_to_detect_player);
         }
         Player::Panicking(panicking) => {
             update_panicking_state(resources, player, minimap_state, panicking);
         }
-        Player::Chatting(chatting) => update_chatting_state(resources, player, chatting),
         Player::UsingBooster(_) => update_using_booster_state(resources, player),
         Player::ExchangingBooster(_) => update_exchanging_booster_state(resources, player),
         Player::Detecting
@@ -291,12 +287,12 @@ fn update_non_positional_state(
 /// Updates the contextual state that requires the player current position.
 #[inline]
 fn update_positional_state(
-    resources: &Resources,
+    resources: &mut Resources,
     player: &mut PlayerEntity,
     minimap_state: Minimap,
 ) {
     match player.state {
-        Player::Detecting => transition!(player, Player::Idle),
+        Player::Detecting => player.state = Player::Idle,
         Player::Idle => update_idle_state(resources, player, minimap_state),
         Player::Moving(_, _, _) => update_moving_state(resources, player, minimap_state),
         Player::Adjusting(_) => update_adjusting_state(resources, player, minimap_state),
@@ -311,10 +307,10 @@ fn update_positional_state(
         | Player::SolvingRune(_)
         | Player::FamiliarsSwapping(_)
         | Player::Panicking(_)
-        | Player::Chatting(_)
         | Player::UsingBooster(_)
         | Player::ExchangingBooster(_)
         | Player::SolvingShape(_)
+        | Player::SolvingVioletta(_)
         | Player::CashShopThenExit(_) => unreachable!(),
     }
 }

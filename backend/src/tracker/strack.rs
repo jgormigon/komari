@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use opencv::core::Rect;
+use opencv::core::{Point2d, Rect};
 
 use super::kalman_filter::KalmanXYAH;
 use crate::tracker::tlwh_to_xyah;
@@ -20,14 +20,16 @@ pub enum TrackState {
 pub struct STrack {
     pub(super) track_id: u64,
     tracklet_len: usize,
+    pub(super) score: f32,
     pub(super) frame_id: u64,
+    pub(super) start_frame_id: u64,
     pub(super) state: TrackState,
     pub(super) kalman: KalmanXYAH,
     pub(super) tlwh: [f32; 4],
 }
 
 impl STrack {
-    pub fn new(bbox: Rect) -> Self {
+    pub fn new(bbox: Rect, score: f32) -> Self {
         let tlwh = [
             bbox.x as f32,
             bbox.y as f32,
@@ -38,7 +40,9 @@ impl STrack {
         Self {
             track_id: 0,
             tracklet_len: 0,
+            score,
             frame_id: 0,
+            start_frame_id: 0,
             state: TrackState::Lost,
             kalman: KalmanXYAH::new(),
             tlwh,
@@ -53,18 +57,20 @@ impl STrack {
         self.tracklet_len
     }
 
-    pub(super) fn activate(&mut self, frame_id: u64) {
+    pub(super) fn activate(&mut self, frame_id: u64, score: f32) {
         self.track_id = TRACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         self.tracklet_len = 0;
         self.frame_id = frame_id;
+        self.start_frame_id = frame_id;
         self.state = TrackState::Tracked;
+        self.score = score;
 
         let meas = tlwh_to_xyah(self.tlwh);
         self.kalman.initiate(meas);
     }
 
-    pub(super) fn reactivate(&mut self, tlwh: [f32; 4], frame_id: u64) {
-        self.update(tlwh, frame_id);
+    pub(super) fn reactivate(&mut self, tlwh: [f32; 4], frame_id: u64, score: f32) {
+        self.update(tlwh, frame_id, score);
         self.tracklet_len = 0;
     }
 
@@ -76,11 +82,12 @@ impl STrack {
         self.kalman.predict();
     }
 
-    pub(super) fn update(&mut self, tlwh: [f32; 4], frame_id: u64) {
+    pub(super) fn update(&mut self, tlwh: [f32; 4], frame_id: u64, score: f32) {
         self.frame_id = frame_id;
         self.tracklet_len += 1;
         self.tlwh = tlwh;
         self.state = TrackState::Tracked;
+        self.score = score;
 
         let meas = tlwh_to_xyah(self.tlwh);
         self.kalman.update(meas);
@@ -113,9 +120,10 @@ impl STrack {
         )
     }
 
-    pub fn kalman_velocity(&self) -> (f32, f32) {
+    pub fn kalman_velocity(&self) -> Point2d {
         let vx = self.kalman.mean[4];
         let vy = self.kalman.mean[5];
-        (vx, vy)
+
+        Point2d::new(vx as f64, vy as f64)
     }
 }

@@ -46,7 +46,7 @@ pub fn SectionPlatforms(disabled: bool) -> Element {
         let mut map = map();
 
         map.platforms.push(platform);
-        coroutine.send(ActionsUpdate::UpdateMinimap(map));
+        coroutine.send(ActionsUpdate::UpdateMap(map));
     };
 
     let edit_platform = move |new_platform: Platform, index: usize| {
@@ -56,14 +56,14 @@ pub fn SectionPlatforms(disabled: bool) -> Element {
         };
 
         *platform = new_platform;
-        coroutine.send(ActionsUpdate::UpdateMinimap(map));
+        coroutine.send(ActionsUpdate::UpdateMap(map));
     };
 
     let delete_platform = move |index| {
         let mut map = map();
 
         map.platforms.remove(index);
-        coroutine.send(ActionsUpdate::UpdateMinimap(map));
+        coroutine.send(ActionsUpdate::UpdateMap(map));
     };
 
     let mut popup_content = use_signal(|| PopupContent::None);
@@ -111,7 +111,7 @@ pub fn SectionPlatforms(disabled: bool) -> Element {
                 popup_open.set(open);
             },
             Section { title: "Platforms",
-                div { class: "grid grid-cols-3 gap-3",
+                div { class: "grid grid-cols-2 gap-3",
                     ActionsCheckbox {
                         label: "Rune pathing",
                         disabled,
@@ -135,7 +135,6 @@ pub fn SectionPlatforms(disabled: bool) -> Element {
                         },
                         checked: map().rune_platforms_pathing_up_jump_only,
                     }
-                    div {}
 
                     ActionsCheckbox {
                         label: "Auto-mobbing pathing",
@@ -159,19 +158,6 @@ pub fn SectionPlatforms(disabled: bool) -> Element {
                             })
                         },
                         checked: map().auto_mob_platforms_pathing_up_jump_only,
-                    }
-
-                    ActionsCheckbox {
-                        label: "Bound by platforms",
-                        tooltip: "Auto-mobbing bound is computed based on the provided platforms instead of the provided bound.",
-                        disabled,
-                        on_checked: move |auto_mob_platforms_bound| {
-                            save_map(Map {
-                                auto_mob_platforms_bound,
-                                ..map.peek().clone()
-                            })
-                        },
-                        checked: map().auto_mob_platforms_bound,
                     }
                 }
 

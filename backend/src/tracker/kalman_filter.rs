@@ -1,4 +1,4 @@
-use nalgebra::{ArrayStorage, Matrix, Matrix4, U1, U4, U8, Vector4};
+use nalgebra::{ArrayStorage, Matrix, Matrix3, Matrix4, U1, U4, U8, Vector3, Vector4};
 
 type Matrix8<T> = Matrix<T, U8, U8, ArrayStorage<T, 8, 8>>;
 type Vector8<T> = Matrix<T, U8, U1, ArrayStorage<T, 8, 1>>;
@@ -117,19 +117,38 @@ impl KalmanXYAH {
         (mean, cov)
     }
 
-    pub fn gating_distance(&self, measurement: Vector4<f32>) -> f32 {
+    pub fn gate(&self, measurement: Vector4<f32>, position_only: bool) -> bool {
         let (projected_mean, projected_cov) = self.project();
         let diff = measurement - projected_mean;
-        let cov_xy = projected_cov.fixed_view::<2, 2>(0, 0).into_owned();
-        let diff_xy = diff.fixed_rows::<2>(0).into_owned();
 
-        let chol = cov_xy.cholesky().expect("SPD");
-        let z = chol.solve(&diff_xy);
-        z.dot(&z)
-    }
+        let gate = if position_only {
+            let cov_xy = projected_cov.fixed_view::<2, 2>(0, 0).into_owned();
+            let diff_xy = diff.fixed_rows::<2>(0).into_owned();
 
-    pub fn gating_threshold(&self) -> f32 {
-        5.9915
+            let chol = cov_xy.cholesky().expect("SPD");
+            let z = chol.solve(&diff_xy);
+            z.dot(&z)
+        } else {
+            let cov_xyh = Matrix3::new(
+                projected_cov[(0, 0)],
+                projected_cov[(0, 1)],
+                projected_cov[(0, 3)],
+                projected_cov[(1, 0)],
+                projected_cov[(1, 1)],
+                projected_cov[(1, 3)],
+                projected_cov[(3, 0)],
+                projected_cov[(3, 1)],
+                projected_cov[(3, 3)],
+            );
+            let diff_xyh = Vector3::new(diff[0], diff[1], diff[3]);
+
+            let chol = cov_xyh.cholesky().expect("SPD");
+            let z = chol.solve(&diff_xyh);
+            z.dot(&z)
+        };
+        let threshold = if position_only { 5.9915 } else { 7.8147 };
+
+        gate > threshold
     }
 
     pub fn tlwh(&self) -> [f32; 4] {

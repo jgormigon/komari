@@ -13,13 +13,12 @@
     - [Auto-mobbing](#auto-mobbing)
     - [Ping Pong](#ping-pong)
   - [Platforms Pathing](#platforms-pathing)
-  - [Navigation](#navigation)
-  - [Run/Stop Cycle](#runstop-cycle)
+  - [Run Timer](#run-timer)
   - [Capture Modes](#capture-modes)
   - [Familiars Swapping](#familiars-swapping)
   - [Panic Mode](#panic-mode)
   - [Elite Boss Spawns Behavior](#elite-boss-spawns-behavior)
-  - [Control and Notifications](#control-and-notifications)
+  - [Notifications](#notifications)
   - [Localization](#localization)
   - [Generic/HEXA Booster](#generichexa-booster)
   - [HEXA Booster Exchange](#hexa-booster-exchange)
@@ -95,9 +94,14 @@ There are two modes available for configuring potion usage:
 
 ##### Movement
 
+- `Up jump is flight` — Treats up jump as flight (e.g., Illium).
+- `Jump then up jump if possible` — Jumps first, then up jumps if available (e.g., Night Lord).
+- `Has extended teleport range` — Teleportation has extended range (e.g., Explorer Mages).
+- `Disable grapple on double jumping` - Disables performing a grapple during double jumping.
 - `Disable teleport on fall` – Disables teleport after falling (useful for mage classes).
 - `Disable double jumping` – Disables the `DoubleJumping` state (e.g., makes the bot only walk).  
   - Works only if the action does not have `Use with = DoubleJump`.
+- `Disable grapple on double jumping` — Prevents grappling during double jump.
 - `Disable walking` – Disables the `Adjusting` state (forces horizontal movement by double jumps only).  
   - Works only if the action does not have `Adjust` ticked.
 
@@ -287,58 +291,12 @@ Use hotkeys to add them quickly.
 
 ---
 
-### Navigation
+### Run Timer
 
-Introduced in **v0.19**.
+Introduced in **v0.24**. (previously known as `Run/stop cycle`)
 
-Enables the bot to navigate automatically between maps using portals.
-
-#### Core Concepts
-
-- `Paths group` – A collection of related paths (e.g., Hotel Arcus).  
-- `Path` – A minimap snapshot containing its name, minimap images and coordinates (e.g., portals).  
-- `Point` – A transition marker to another path.
-
-#### Setup Steps
-
-1. Opens the `Navigation` tab.  
-2. Notes down the desired route (e.g., Esfera Base Camp → Esfera Mirror-touched Sea 3).  
-3. Creates a `Paths group` (e.g., Esfera).  
-4. Goes to each map and ensures the minimap is detected.  
-5. Clicks `Add path` – captures the minimap and name images for matching.  
-6. Clicks `Add point` – records portal coordinates and links to next path.  
-7. Repeats from 3. until all paths are added.  
-8. Attaches a created path to the current map under `Navigation` → `Selected map` → `Attached paths group` and `Attached path`.
-
-When started, the bot will navigate to the attached path before rotating actions.  
-Useful for:
-- Run/stop cycles (e.g., returns to town on stop cycle and navigates back).  
-- Navigates back to original map if the bot changes map accidentally.
-
-#### Limitations
-
-- No interaction-based navigation yet.  
-- Cannot handle portals leading to `Unstucking` state positions.
-
-![Navigation](https://github.com/sasanquaa/komari/blob/master/.github/images/navigation.png?raw=true)
-
-From **v0.21**, added `Use grayscale for map` option for better minimap matching if color-based detection fails.
-
----
-
-### Run/Stop Cycle
-
-Introduced in **v0.19**.
-
-Found under `Settings` → `Run/stop cycle`:
-
-- `None` – Runs or stops indefinately (default behavior).  
-- `Once` – Runs for a specified duration, then stops and returns to town.  
-- `Repeat` – Alternates between running and resting in town.
-
-**For this to work:**
-- Key binding for `To town` is set.  
-- If `Repeat` mode is used, navigation paths must be setup.
+Found under `Settings` → `Run timer`. When enabled, the bot runs for the specified duration, stop
+and return to town. **As such, the key binding for `To town` must be set.**
 
 The `Suspend` button allows pausing temporarily without resetting timer.
 
@@ -412,13 +370,9 @@ Available behaviors:
 
 ---
 
-### Control and Notifications
+### Notifications
 
-Uses Discord webhook or bot token for notifications and remote control.
-
-#### Notifications
-
-Provide a **webhook URL** (for notifications only) or a **bot token** (for full control).
+Provide a **webhook URL** for notifications in `Settings` → `Notifications`.
 
 Available notification types:
 - Rune Spawns  
@@ -430,21 +384,6 @@ Available notification types:
 - Detection Fails / Map Changes
 
 If `Discord ping user ID` is set, the bot pings that user in the notification message.
-
-#### Discord Commands
-
-Introduced in **v0.20**.
-
-- `/status` – Shows current status, runtime, and image.  
-- `/start` – Starts the bot.  
-- `/stop` – Stops the bot (optionally goes to town).  
-- `/suspend` – Pauses temporarily (or fully if no cycle is active).  
-- `/start-stream` – Streams status periodically (up to 15 min).  
-- `/stop-stream` – Stops streaming.  
-- `/chat` – Sends in-game chat (ASCII only).  
-- `/action` – Performs a specified action (with kind and count).
-
-> The Discord bot is experimental and may change.
 
 ---
 

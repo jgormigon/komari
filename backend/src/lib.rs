@@ -27,7 +27,6 @@ use tokio::{
 mod array;
 mod bridge;
 mod buff;
-mod control;
 mod database;
 #[cfg(debug_assertions)]
 mod debug;
@@ -37,7 +36,6 @@ mod grpc;
 mod mat;
 mod minimap;
 mod models;
-mod navigator;
 mod notification;
 mod operation;
 mod pathing;
@@ -108,10 +106,7 @@ pub enum TransparentShapeDifficulty {
 enum Request {
     UpdateOperation(OperationUpdate),
     CreateMap(String),
-    UpdateMap(Option<String>, Option<Map>),
-    CreateNavigationPath,
-    RecaptureNavigationPath(NavigationPath),
-    NavigationSnapshotAsGrayscale(String),
+    UpdateMap(Option<Map>, Option<String>),
     UpdateCharacter(Option<Character>),
     RedetectMinimap,
     StateReceiver,
@@ -127,9 +122,13 @@ enum Request {
     #[cfg(debug_assertions)]
     AutoSaveRune(bool),
     #[cfg(debug_assertions)]
+    AutoRecordLieDetector(bool),
+    #[cfg(debug_assertions)]
     RecordVideo(bool),
     #[cfg(debug_assertions)]
     TestSpinRune,
+    #[cfg(debug_assertions)]
+    TestVioletta,
     #[cfg(debug_assertions)]
     TestTransparentShape(TransparentShapeDifficulty),
 }
@@ -143,9 +142,6 @@ enum Response {
     UpdateOperation,
     CreateMap(Option<Map>),
     UpdateMap,
-    CreateNavigationPath(Option<NavigationPath>),
-    RecaptureNavigationPath(NavigationPath),
-    NavigationSnapshotAsGrayscale(String),
     UpdateCharacter,
     RedetectMinimap,
     StateReceiver(broadcast::Receiver<State>),
@@ -161,9 +157,13 @@ enum Response {
     #[cfg(debug_assertions)]
     AutoSaveRune,
     #[cfg(debug_assertions)]
+    AutoRecordLieDetector,
+    #[cfg(debug_assertions)]
     RecordVideo,
     #[cfg(debug_assertions)]
     TestSpinRune,
+    #[cfg(debug_assertions)]
+    TestVioletta,
     #[cfg(debug_assertions)]
     TestTransparentShape,
 }
@@ -187,6 +187,8 @@ pub enum DetectionTemplate {
     HexaBoosterButton,
     HexaMaxButton,
     HexaConvertButton,
+    LieDetectorNew,
+    LieDetectorOld,
 }
 
 /// The four quads of a bound.
@@ -204,6 +206,7 @@ pub enum BoundQuadrant {
 pub struct DebugState {
     pub is_recording: bool,
     pub is_rune_auto_saving: bool,
+    pub is_lie_detector_auto_recording: bool,
 }
 
 /// A struct for storing current's bot state information.
@@ -219,7 +222,6 @@ pub struct State {
     pub destinations: Vec<(i32, i32)>,
     pub operation: Operation,
     pub frame: Option<(Vec<u8>, usize, usize)>,
-    pub platforms_bound: Option<Bound>,
     pub portals: Vec<Bound>,
     pub auto_mob_quadrant: Option<BoundQuadrant>,
 }
@@ -228,7 +230,6 @@ pub struct State {
 pub enum Operation {
     Halting,
     TemporaryHalting(Duration),
-    HaltUntil(Instant),
     Running,
     RunUntil(Instant),
 }
@@ -306,8 +307,8 @@ pub async fn upsert_map(mut map: Map) -> Option<Map> {
 }
 
 /// Updates the current map used by the main game loop.
-pub async fn update_map(preset: Option<String>, map: Option<Map>) {
-    send_request!(UpdateMap(preset, map))
+pub async fn update_map(map: Option<Map>, preset: Option<String>) {
+    send_request!(UpdateMap(map, preset))
 }
 
 /// Deletes `map` from the database.
@@ -315,55 +316,6 @@ pub async fn update_map(preset: Option<String>, map: Option<Map>) {
 /// Returns `true` if the map was deleted.
 pub async fn delete_map(map: Map) -> bool {
     spawn_blocking(move || database::delete_map(&map).is_ok())
-        .await
-        .unwrap()
-}
-
-/// Queries navigation paths from the database.
-pub async fn query_navigation_paths() -> Option<Vec<NavigationPaths>> {
-    spawn_blocking(database::query_navigation_paths)
-        .await
-        .unwrap()
-        .ok()
-}
-
-/// Creates a navigation path from currently detected map.
-pub async fn create_navigation_path() -> Option<NavigationPath> {
-    send_request!(CreateNavigationPath => (path))
-}
-
-/// Upserts `paths` to the database.
-///
-/// Returns the updated [`NavigationPaths`] on success.
-pub async fn upsert_navigation_paths(mut paths: NavigationPaths) -> Option<NavigationPaths> {
-    spawn_blocking(move || {
-        database::upsert_navigation_paths(&mut paths)
-            .is_ok()
-            .then_some(paths)
-    })
-    .await
-    .unwrap()
-}
-
-/// Recaptures snapshots for the provided `path`.
-///
-/// Snapshots include name and map will be recaptured and re-assigned to the given `path` if
-/// the map is currently detected.
-///
-/// Returns the updated [`NavigationPath`] or original if map is currently not detectable.
-pub async fn recapture_navigation_path(path: NavigationPath) -> NavigationPath {
-    send_request!(RecaptureNavigationPath(path) => (path))
-}
-
-pub async fn navigation_snapshot_as_grayscale(base64: String) -> String {
-    send_request!(NavigationSnapshotAsGrayscale(base64) => (base64))
-}
-
-/// Deletes `paths` from the database.
-///
-/// Returns `true` if `paths` was deleted.
-pub async fn delete_navigation_paths(paths: NavigationPaths) -> bool {
-    spawn_blocking(move || database::delete_navigation_paths(&paths).is_ok())
         .await
         .unwrap()
 }
@@ -453,6 +405,11 @@ pub async fn auto_save_rune(auto_save: bool) {
 }
 
 #[cfg(debug_assertions)]
+pub async fn auto_record_lie_detector(auto_record: bool) {
+    send_request!(AutoRecordLieDetector(auto_record))
+}
+
+#[cfg(debug_assertions)]
 pub async fn record_video(start: bool) {
     send_request!(RecordVideo(start))
 }
@@ -460,6 +417,11 @@ pub async fn record_video(start: bool) {
 #[cfg(debug_assertions)]
 pub async fn test_spin_rune() {
     send_request!(TestSpinRune)
+}
+
+#[cfg(debug_assertions)]
+pub async fn test_violetta() {
+    send_request!(TestVioletta)
 }
 
 #[cfg(debug_assertions)]
