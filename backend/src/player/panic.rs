@@ -119,6 +119,19 @@ pub fn update_panicking_state(
         None => {
             // Allow continuing for town even if the bot has already halted
             // Force cancel if it is not initiated from an action for other panic kind
+            if !matches!(panicking.to, PanicTo::Town) {
+                // The panic action can be aborted mid-flight (e.g. the stranger that
+                // triggered it disappeared before the channel change completed) while the
+                // change-channel menu/popup is still open on screen, blocking all input.
+                // Dismiss it here since we are about to abandon `Panicking` entirely and
+                // fall back to normal actions.
+                if resources.detector().detect_change_channel_menu_opened()
+                    || resources.detector().detect_esc_settings()
+                {
+                    resources.input.send_key(KeyKind::Esc);
+                }
+            }
+
             player.state = if matches!(panicking.to, PanicTo::Town) {
                 player_next_state
             } else {
@@ -196,6 +209,11 @@ fn update_changing_channel(
                 {
                     resources.input.send_key(KeyKind::Enter);
                 }
+            } else if resources.detector().detect_esc_settings() {
+                // An unexpected dialog (e.g. "cannot change channel") may be blocking the
+                // channel menu from opening. Dismiss it so the retry/timeout logic below can
+                // eventually recover instead of looping stuck on this dialog.
+                resources.input.send_key(KeyKind::Esc);
             }
 
             panicking.state = State::ChangingChannel(timeout, retry_count);
@@ -253,6 +271,12 @@ fn update_completing(resources: &mut Resources, panicking: &mut Panicking, minim
                 }
             }
             Minimap::Detecting => {
+                // Minimap may stay undetectable because a dialog (e.g. a leftover
+                // confirmation popup) is blocking it. Dismiss it so this doesn't loop
+                // forever waiting for the minimap to become idle again.
+                if resources.detector().detect_esc_settings() {
+                    resources.input.send_key(KeyKind::Esc);
+                }
                 panicking.state = State::Completing(Timeout::default(), false);
             }
         },

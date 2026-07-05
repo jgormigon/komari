@@ -71,7 +71,9 @@ pub fn update_unstucking_state(
 
     match unstucking.kind {
         UnstuckingKind::Esc => {
-            if resources.detector().detect_esc_settings() {
+            if resources.detector().detect_esc_settings()
+                || resources.detector().detect_change_channel_menu_opened()
+            {
                 resources.input.send_key(KeyKind::Esc);
             }
 
