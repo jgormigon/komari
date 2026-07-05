@@ -483,10 +483,7 @@ fn Canvas(
             RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => None,
             RotationMode::AutoMobbing => Some((map.rotation_auto_mob_bound, "AutoMobbing")),
             RotationMode::PingPong => Some((map.rotation_ping_pong_bound, "PingPong")),
-            RotationMode::MonsterPark => Some((
-                platforms_bound.unwrap_or(map.rotation_auto_mob_bound),
-                "MonsterPark",
-            )),
+            RotationMode::MonsterPark => Some((map.rotation_auto_mob_bound, "MonsterPark")),
         }
     });
 

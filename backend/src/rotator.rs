@@ -663,7 +663,7 @@ impl DefaultRotator {
 
     fn rotate_monster_park(
         &mut self,
-        resources: &Resources,
+        resources: &mut Resources,
         player_context: &mut PlayerContext,
         minimap_state: Minimap,
         key: MobbingKey,
@@ -686,16 +686,13 @@ impl DefaultRotator {
             return;
         };
 
-        let bound_rect = if player_context.config.auto_mob_platforms_bound {
-            idle.platforms_bound.unwrap_or(bound.into())
-        } else {
-            bound.into()
-        };
+        let bound_rect = bound.into();
 
         // Check for mobs first
+        let name = player_context.name();
         let Update::Ok(mob_points) =
             update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
-                detector.detect_mobs(idle.bbox, bound_rect, pos)
+                detector.detect_mobs(idle.bbox, bound_rect, pos, name)
             })
         else {
             return;
@@ -840,7 +837,10 @@ impl DefaultRotator {
             };
             player_context.set_normal_action(
                 None,
-                PlayerAction::Move(Move { position }),
+                PlayerAction::Move(Move {
+                    position,
+                    wait_after_move_ticks: 0,
+                }),
             );
             debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
         }
