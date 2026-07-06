@@ -64,29 +64,33 @@ pub fn update_unstucking_state(
     let Player::Unstucking(unstucking) = player.state else {
         panic!("state is not unstucking");
     };
+
+    // A blocking dialog/menu (e.g. the change-channel popup) can itself prevent the minimap
+    // from being detected, so this must run before the `Minimap::Idle` check below instead of
+    // being gated behind it - otherwise it would never get a chance to dismiss the very thing
+    // that is blocking detection.
+    if matches!(unstucking.kind, UnstuckingKind::Esc)
+        && (resources.detector().detect_esc_settings()
+            || resources.detector().detect_change_channel_menu_opened())
+    {
+        resources.input.send_key(KeyKind::Esc);
+    }
+
     let Minimap::Idle(idle) = minimap_state else {
         player.state = Player::Detecting;
         return;
     };
 
     match unstucking.kind {
-        UnstuckingKind::Esc => {
-            if resources.detector().detect_esc_settings()
-                || resources.detector().detect_change_channel_menu_opened()
-            {
-                resources.input.send_key(KeyKind::Esc);
+        UnstuckingKind::Esc => match next_action(&player.context) {
+            Some(PlayerAction::Unstuck) => {
+                player.context.clear_action_completed();
+                player.state = Player::Detecting;
             }
-
-            match next_action(&player.context) {
-                Some(PlayerAction::Unstuck) => {
-                    player.context.clear_action_completed();
-                    player.state = Player::Detecting;
-                }
-                Some(_) | None => {
-                    player.state = Player::Detecting;
-                }
+            Some(_) | None => {
+                player.state = Player::Detecting;
             }
-        }
+        },
         UnstuckingKind::Movement { timeout, random } => {
             let context = &mut player.context;
             let pos = context
