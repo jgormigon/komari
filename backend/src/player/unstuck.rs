@@ -68,10 +68,11 @@ pub fn update_unstucking_state(
     // A blocking dialog/menu (e.g. the change-channel popup) can itself prevent the minimap
     // from being detected, so this must run before the `Minimap::Idle` check below instead of
     // being gated behind it - otherwise it would never get a chance to dismiss the very thing
-    // that is blocking detection.
-    if matches!(unstucking.kind, UnstuckingKind::Esc)
-        && (resources.detector().detect_esc_settings()
-            || resources.detector().detect_change_channel_menu_opened())
+    // that is blocking detection. This also applies regardless of `UnstuckingKind`: the bot can
+    // land here from automatic stuck detection (`Movement`) just as easily as from an explicit
+    // `Unstuck` action (`Esc`), and a leftover dialog can be the actual cause of being stuck.
+    if resources.detector().detect_esc_settings()
+        || resources.detector().detect_change_channel_menu_opened()
     {
         resources.input.send_key(KeyKind::Esc);
     }
