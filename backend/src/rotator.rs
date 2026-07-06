@@ -568,12 +568,18 @@ impl DefaultRotator {
         let bound = bound.into();
 
         let name = player_context.name();
-        let Update::Ok(points) =
-            update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
-                detector.detect_mobs(idle.bbox, bound, pos, name)
-            })
-        else {
-            return;
+        let points = match update_detection_task(
+            resources,
+            0,
+            &mut self.auto_mob_task,
+            move |detector| detector.detect_mobs(idle.bbox, bound, pos, name),
+        ) {
+            Update::Ok(points) => points,
+            Update::Err(err) => {
+                debug!(target: "backend/rotator", "auto mob detection failed: {err:?}");
+                return;
+            }
+            Update::Pending => return,
         };
         let points = points
             .iter()
@@ -690,12 +696,18 @@ impl DefaultRotator {
 
         // Check for mobs first
         let name = player_context.name();
-        let Update::Ok(mob_points) =
-            update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
-                detector.detect_mobs(idle.bbox, bound_rect, pos, name)
-            })
-        else {
-            return;
+        let mob_points = match update_detection_task(
+            resources,
+            0,
+            &mut self.auto_mob_task,
+            move |detector| detector.detect_mobs(idle.bbox, bound_rect, pos, name),
+        ) {
+            Update::Ok(mob_points) => mob_points,
+            Update::Err(err) => {
+                debug!(target: "backend/rotator", "auto mob detection failed: {err:?}");
+                return;
+            }
+            Update::Pending => return,
         };
 
         // Filter and process mob points similar to auto mobbing
@@ -791,7 +803,7 @@ impl DefaultRotator {
         let portals = idle.portals();
         let Some(portal) = portals.iter().next() else {
             // No portal found, Monster Park is complete for this map
-            debug!(target: "rotator", "Monster Park: No mobs and no portal found, map complete");
+            debug!(target: "backend/rotator", "Monster Park: No mobs and no portal found, map complete");
             return;
         };
 
@@ -826,7 +838,7 @@ impl DefaultRotator {
                 wait_after_buffered: WaitAfterBuffered::None,
             };
             player_context.set_priority_action(None, PlayerAction::Key(key));
-            debug!(target: "rotator", "Monster Park: Player at portal, pressing Up key");
+            debug!(target: "backend/rotator", "Monster Park: Player at portal, pressing Up key");
         } else {
             // Player is not at portal, move towards it
             let position = Position {
@@ -842,7 +854,7 @@ impl DefaultRotator {
                     wait_after_move_ticks: 0,
                 }),
             );
-            debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
+            debug!(target: "backend/rotator", "Monster Park: Moving to portal at {:?}", portal_center);
         }
     }
 
