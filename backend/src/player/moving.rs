@@ -400,6 +400,13 @@ pub fn update_moving_state(
 /// Aborts the action when state starts looping.
 ///
 /// Note: Initially, this is only intended for auto mobbing until rune pathing is added...
+///
+/// Instead of silently giving up on the destination, this routes into [`Player::Unstucking`] so
+/// a destination that keeps repeatedly failing (e.g. unreachable because the player is wedged
+/// against the edge of the map) still goes through the same escalating recovery (dismissing
+/// stray dialogs, moving/jumping in a random direction, and eventually pressing
+/// [`PlayerConfiguration::blink_key`]) instead of being silently dropped forever. The action
+/// itself is not cleared, so it is retried once the recovery attempt ends.
 #[inline]
 fn abort_action_on_state_repeat(
     player: &mut PlayerEntity,
@@ -409,8 +416,13 @@ fn abort_action_on_state_repeat(
     if player.context.track_last_movement_repeated() {
         info!(target:"backend/player","abort action due to repeated state");
         player.context.auto_mob_track_ignore_xs(minimap_state, true);
-        player.context.clear_action_completed();
-        player.state = Player::Idle;
+        // Resets the repeat count so the action gets a fresh attempt after this recovery
+        // instead of immediately re-triggering this same abort on the very next tick.
+        player.context.clear_last_movement();
+        let random = player.context.track_unstucking_transitioned();
+        let blink = random && player.context.track_unstucking_gamba();
+        player.state =
+            Player::Unstucking(Unstucking::new_movement(Timeout::default(), random, blink));
         return;
     }
 
