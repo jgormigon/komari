@@ -201,10 +201,9 @@ pub fn run_system(
             Minimap::Idle(idle) => !idle.partially_overlapping,
         };
         if is_stucking {
-            let unstucking = Unstucking::new_movement(
-                Timeout::default(),
-                player.context.track_unstucking_transitioned(),
-            );
+            let random = player.context.track_unstucking_transitioned();
+            let blink = random && player.context.track_unstucking_gamba();
+            let unstucking = Unstucking::new_movement(Timeout::default(), random, blink);
             player.state = Player::Unstucking(unstucking);
             player.context.last_known_direction = ActionKeyDirection::Any;
             return;

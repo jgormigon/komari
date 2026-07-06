@@ -81,6 +81,10 @@ const UNSTUCK_COUNT_THRESHOLD: u32 = 6;
 /// The number of times [`Player::Unstucking`] can be transitioned to before entering GAMBA MODE.
 const UNSTUCK_GAMBA_MODE_COUNT: u32 = 3;
 
+/// The number of times GAMBA MODE can be entered without changing position before pressing
+/// [`PlayerConfiguration::blink_key`] as a last resort.
+const UNSTUCK_BLINK_COUNT: u32 = 2;
+
 /// The number of samples to store for approximating velocity.
 const VELOCITY_SAMPLES: usize = MOVE_TIMEOUT as usize;
 
@@ -200,6 +204,9 @@ pub struct PlayerConfiguration {
     pub grappling_key: Option<KeyKind>,
     /// The teleport key with [`None`] indicating double jump.
     pub teleport_key: Option<KeyKind>,
+    /// The `Blink` skill key used as a last resort in [`Player::Unstucking`] when GAMBA MODE
+    /// has repeatedly failed to change the player position.
+    pub blink_key: Option<KeyKind>,
     /// The jump key.
     ///
     /// Replaces the previously default [`KeyKind::Space`] key.
@@ -246,6 +253,7 @@ impl Default for PlayerConfiguration {
             interact_key: KeyKind::A,
             grappling_key: None,
             teleport_key: None,
+            blink_key: None,
             jump_key: KeyKind::A,
             up_jump_key: None,
             cash_shop_key: None,
@@ -361,6 +369,10 @@ pub struct PlayerContext {
     ///
     /// Resets when threshold reached or position changed.
     unstuck_transitioned_count: u32,
+    /// The number of times GAMBA MODE was entered.
+    ///
+    /// Resets when threshold reached or position changed.
+    unstuck_gamba_count: u32,
 
     /// The number of times [`Player::SolvingRune`] failed.
     rune_failed_count: u32,
@@ -617,6 +629,7 @@ impl PlayerContext {
         self.unstuck_count = 0;
         if include_transitioned_count {
             self.unstuck_transitioned_count = 0;
+            self.unstuck_gamba_count = 0;
         }
     }
 
@@ -697,6 +710,21 @@ impl PlayerContext {
         self.unstuck_transitioned_count += 1;
         if self.unstuck_transitioned_count >= UNSTUCK_GAMBA_MODE_COUNT {
             self.unstuck_transitioned_count = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Increments the GAMBA MODE counter.
+    ///
+    /// Returns `true` when [`Player::Unstucking`] should press
+    /// [`PlayerConfiguration::blink_key`] as a last resort.
+    #[inline]
+    pub(super) fn track_unstucking_gamba(&mut self) -> bool {
+        self.unstuck_gamba_count += 1;
+        if self.unstuck_gamba_count >= UNSTUCK_BLINK_COUNT {
+            self.unstuck_gamba_count = 0;
             true
         } else {
             false
@@ -1330,6 +1358,7 @@ impl PlayerContext {
         if last_known_pos != pos {
             self.unstuck_count = 0;
             self.unstuck_transitioned_count = 0;
+            self.unstuck_gamba_count = 0;
             self.is_stationary_timeout = Timeout::default();
         }
         self.update_velocity(pos, resources.tick);

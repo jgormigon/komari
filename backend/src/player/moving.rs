@@ -267,10 +267,10 @@ pub fn update_moving_state(
 
     player.state = Player::Idle; // Sets initial next state first
     if context.track_unstucking() {
-        player.state = Player::Unstucking(Unstucking::new_movement(
-            Timeout::default(),
-            context.track_unstucking_transitioned(),
-        ));
+        let random = context.track_unstucking_transitioned();
+        let blink = random && context.track_unstucking_gamba();
+        player.state =
+            Player::Unstucking(Unstucking::new_movement(Timeout::default(), random, blink));
         return;
     }
 

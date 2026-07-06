@@ -40,6 +40,19 @@ pub fn SectionKeyBindings() -> Element {
                     value: character().teleport_key,
                 }
                 CharactersKeyBindingConfigurationInput {
+                    label: "Blink",
+                    optional: true,
+                    disabled: character().id.is_none(),
+                    tooltip: "Used as a last resort to escape being stuck (e.g. wandered off the minimap) when normal unstucking movement repeatedly fails.",
+                    on_value: move |blink_key| {
+                        save_character(Character {
+                            blink_key,
+                            ..character.peek().clone()
+                        });
+                    },
+                    value: character().blink_key,
+                }
+                CharactersKeyBindingConfigurationInput {
                     label: "Jump",
                     disabled: character().id.is_none(),
                     on_value: move |key_config: Option<KeyBindingConfiguration>| {

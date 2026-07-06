@@ -15,6 +15,8 @@ pub struct Character {
     pub name: String,
     pub ropelift_key: Option<KeyBindingConfiguration>,
     pub teleport_key: Option<KeyBindingConfiguration>,
+    #[serde(default)]
+    pub blink_key: Option<KeyBindingConfiguration>,
     #[serde(default = "jump_key_default")]
     pub jump_key: KeyBindingConfiguration,
     pub up_jump_key: Option<KeyBindingConfiguration>,
@@ -101,6 +103,7 @@ impl Default for Character {
             name: String::new(),
             ropelift_key: None,
             teleport_key: None,
+            blink_key: None,
             jump_key: jump_key_default(),
             up_jump_key: None,
             interact_key: key_default(),

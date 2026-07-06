@@ -45,6 +45,7 @@ impl CharacterService for DefaultCharacterService {
             player_context.config.interact_key = character.interact_key.key.into();
             player_context.config.grappling_key = character.ropelift_key.map(|key| key.key.into());
             player_context.config.teleport_key = character.teleport_key.map(|key| key.key.into());
+            player_context.config.blink_key = character.blink_key.map(|key| key.key.into());
             player_context.config.jump_key = character.jump_key.key.into();
             player_context.config.up_jump_key = character.up_jump_key.map(|key| key.key.into());
             player_context.config.cash_shop_key = character.cash_shop_key.map(|key| key.key.into());
@@ -90,6 +91,10 @@ mod tests {
             }),
             teleport_key: Some(KeyBindingConfiguration {
                 key: KeyBinding::X,
+                ..Default::default()
+            }),
+            blink_key: Some(KeyBindingConfiguration {
+                key: KeyBinding::Q,
                 ..Default::default()
             }),
             jump_key: KeyBindingConfiguration {
@@ -182,6 +187,7 @@ mod tests {
         assert_eq!(state.config.interact_key, KeyKind::Z);
         assert_eq!(state.config.grappling_key, Some(KeyKind::V));
         assert_eq!(state.config.teleport_key, Some(KeyKind::X));
+        assert_eq!(state.config.blink_key, Some(KeyKind::Q));
         assert_eq!(state.config.jump_key, KeyKind::C);
         assert_eq!(state.config.up_jump_key, Some(KeyKind::A));
         assert_eq!(state.config.cash_shop_key, Some(KeyKind::B));
