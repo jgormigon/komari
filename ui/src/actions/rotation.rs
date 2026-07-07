@@ -34,6 +34,13 @@ pub fn SectionRotation(disabled: bool) -> Element {
         )
     });
 
+    // Monster Park always sweeps the whole map (enemies are read directly off the minimap), so
+    // its mobbing bound is not configurable.
+    let update_mobbing_bound_disabled = use_memo(move || {
+        let mode = map().rotation_mode;
+        !matches!(mode, RotationMode::AutoMobbing | RotationMode::PingPong)
+    });
+
     let edit_mobbing_key = move |rotation_mobbing_key| {
         save_map(Map {
             rotation_mobbing_key,
@@ -45,8 +52,10 @@ pub fn SectionRotation(disabled: bool) -> Element {
         let mut map = map();
 
         match map.rotation_mode {
-            RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => return,
-            RotationMode::AutoMobbing | RotationMode::MonsterPark => {
+            RotationMode::StartToEnd
+            | RotationMode::StartToEndThenReverse
+            | RotationMode::MonsterPark => return,
+            RotationMode::AutoMobbing => {
                 map.rotation_auto_mob_bound = bound;
             }
             RotationMode::PingPong => {
@@ -75,10 +84,12 @@ pub fn SectionRotation(disabled: bool) -> Element {
     let handle_mobbing_bound_click = move || {
         let map = map.peek();
         let bound = match map.rotation_mode {
-            RotationMode::StartToEnd | RotationMode::StartToEndThenReverse => {
-                unreachable!()
+            RotationMode::StartToEnd
+            | RotationMode::StartToEndThenReverse
+            | RotationMode::MonsterPark => {
+                unreachable!("button is disabled for this mode")
             }
-            RotationMode::AutoMobbing | RotationMode::MonsterPark => map.rotation_auto_mob_bound,
+            RotationMode::AutoMobbing => map.rotation_auto_mob_bound,
             RotationMode::PingPong => map.rotation_ping_pong_bound,
         };
         popup_content.set(PopupContent::Bound(bound));
@@ -127,7 +138,7 @@ pub fn SectionRotation(disabled: bool) -> Element {
                         Button {
                             style: ButtonStyle::Primary,
                             class: "w-full",
-                            disabled: disabled || update_mobbing_key_disabled(),
+                            disabled: disabled || update_mobbing_bound_disabled(),
                             on_click: handle_mobbing_bound_click,
 
                             "Update mobbing bound"

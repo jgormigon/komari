@@ -147,6 +147,32 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects the new popup `OK` button.
     fn detect_popup_ok_new_button(&self) -> Result<Rect>;
 
+    /// Detects an NPC dialog's `Next` or `End Chat` button, e.g. the Monster Park completion
+    /// reward dialog.
+    fn detect_popup_dialog_continue_button(&self) -> Result<Rect>;
+
+    /// Detects whether the current on-screen map is Monster Park's entry lobby, as opposed to
+    /// one of the run's actual stages.
+    fn detect_monster_park_entry_map(&self) -> bool;
+
+    /// Detects the Monster Park dungeon-select dialog's `Free Entry Ticket` label.
+    ///
+    /// Used as the anchor to locate the rest of the dialog's elements.
+    fn detect_monster_park_ticket_label(&self) -> Result<Rect>;
+
+    /// Detects the Monster Park dungeon-select dialog's free entry ticket count.
+    fn detect_monster_park_ticket_count(&self) -> Result<u32>;
+
+    /// Detects the Monster Park dungeon-select dialog's "free clear(s) remaining" text.
+    fn detect_monster_park_free_clear_text(&self) -> Result<Rect>;
+
+    /// Detects the locked/unavailable dungeon tile icons in the Monster Park dungeon-select
+    /// dialog.
+    fn detect_monster_park_locked_dungeon_tiles(&self) -> Vec<Rect>;
+
+    /// Detects the Monster Park dungeon-select dialog's `Enter` button.
+    fn detect_monster_park_enter_button(&self) -> Result<Rect>;
+
     /// Detects whether there is an elite boss bar.
     fn detect_elite_boss_bar(&self) -> bool;
 
@@ -160,6 +186,11 @@ pub trait Detector: Debug + Send + Sync {
     ///
     /// Returns `Rect` relative to `minimap` coordinate.
     fn detect_minimap_portals(&self, minimap: Rect) -> Vec<Rect>;
+
+    /// Detects Monster Park enemies (red dots) from the given `minimap` rectangle.
+    ///
+    /// Returns `Rect`s relative to `minimap` coordinate.
+    fn detect_minimap_monster_park_enemies(&self, minimap: Rect) -> Vec<Rect>;
 
     /// Detects the rune from the given `minimap` rectangle.
     ///
@@ -370,6 +401,35 @@ impl Detector for DefaultDetector {
         detect_popup_ok_new_button(self.grayscale(), &self.localization)
     }
 
+    fn detect_popup_dialog_continue_button(&self) -> Result<Rect> {
+        detect_popup_next_button(self.grayscale(), &self.localization)
+            .or_else(|_| detect_popup_end_chat_button(self.grayscale(), &self.localization))
+    }
+
+    fn detect_monster_park_entry_map(&self) -> bool {
+        detect_monster_park_entry_map(self.bgr())
+    }
+
+    fn detect_monster_park_ticket_label(&self) -> Result<Rect> {
+        detect_monster_park_ticket_label(self.grayscale())
+    }
+
+    fn detect_monster_park_ticket_count(&self) -> Result<u32> {
+        detect_monster_park_ticket_count(self.bgr(), self.grayscale())
+    }
+
+    fn detect_monster_park_free_clear_text(&self) -> Result<Rect> {
+        detect_monster_park_free_clear_text(self.grayscale())
+    }
+
+    fn detect_monster_park_locked_dungeon_tiles(&self) -> Vec<Rect> {
+        detect_monster_park_locked_dungeon_tiles(self.grayscale())
+    }
+
+    fn detect_monster_park_enter_button(&self) -> Result<Rect> {
+        detect_monster_park_enter_button(self.grayscale())
+    }
+
     fn detect_elite_boss_bar(&self) -> bool {
         detect_elite_boss_bar(self.grayscale())
     }
@@ -380,6 +440,10 @@ impl Detector for DefaultDetector {
 
     fn detect_minimap_portals(&self, minimap: Rect) -> Vec<Rect> {
         detect_minimap_portals(self.bgr().roi(minimap).unwrap())
+    }
+
+    fn detect_minimap_monster_park_enemies(&self, minimap: Rect) -> Vec<Rect> {
+        detect_minimap_monster_park_enemies(self.bgr().roi(minimap).unwrap())
     }
 
     fn detect_minimap_rune(&self, minimap: Rect) -> Result<Rect> {
@@ -898,6 +962,96 @@ fn detect_popup_end_chat_button(
     )
 }
 
+fn detect_monster_park_entry_map(bgr: &impl ToInputArray) -> bool {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("MONSTER_PARK_ENTRY_MAP_TEMPLATE")), IMREAD_COLOR)
+            .unwrap()
+    });
+
+    detect_template(bgr, &*TEMPLATE, Point::default(), 0.75).is_ok()
+}
+
+fn detect_monster_park_ticket_label(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_TICKET_LABEL_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
+fn detect_monster_park_ticket_count(
+    bgr: &impl MatTraitConst,
+    grayscale: &impl ToInputArray,
+) -> Result<u32> {
+    // The ticket count number sits on the same row as the label, offset to the right (measured
+    // empirically from the dialog layout).
+    const NUMBER_X_OFFSET: i32 = 400;
+    const NUMBER_WIDTH: i32 = 68;
+
+    let label = detect_monster_park_ticket_label(grayscale)?;
+    let number_bbox = Rect::new(label.x + NUMBER_X_OFFSET, label.y, NUMBER_WIDTH, label.height);
+
+    extract_texts(bgr, &[number_bbox])
+        .first()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .ok_or(anyhow!("cannot detect Monster Park ticket count"))
+}
+
+fn detect_monster_park_free_clear_text(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_FREE_CLEAR_TEXT_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
+fn detect_monster_park_locked_dungeon_tiles(grayscale: &impl ToInputArray) -> Vec<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_DUNGEON_LOCKED_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+    const MAX_LOCKED_TILES: usize = 10;
+
+    // A lower threshold than most other UI templates: missing even one locked tile can throw
+    // off the grid calibration in `last_active_dungeon_tile`, while there is nothing else on
+    // this dialog that plausibly resembles the leaf icon closely enough to false-positive.
+    detect_template_multiple(
+        grayscale,
+        &*TEMPLATE,
+        no_array(),
+        Point::default(),
+        MAX_LOCKED_TILES,
+        0.65,
+    )
+    .into_iter()
+    .filter_map(|result| result.ok())
+    .map(|(bbox, _)| bbox)
+    .collect()
+}
+
+fn detect_monster_park_enter_button(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_ENTER_BUTTON_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
 fn detect_popup_ok_new_button(
     grayscale: &impl ToInputArray,
     localization: &Localization,
@@ -1150,6 +1304,42 @@ fn detect_minimap_portals<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Ve
             PORTAL_EXPAND_SIZE,
         )
     })
+    .collect::<Vec<_>>()
+}
+
+fn detect_minimap_monster_park_enemies<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Vec<Rect> {
+    /// TODO: Support default ratio
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_ENEMY_TEMPLATE")),
+            IMREAD_COLOR,
+        )
+        .unwrap()
+    });
+    const MAX_ENEMIES: usize = 32;
+
+    // Enemy dots can sit close together or overlap on screen. The default suppression (a full
+    // template-sized box zeroed out around each match, to avoid re-matching the same instance)
+    // can erase a second, genuinely distinct dot before the search gets a chance to find it -
+    // suppress a smaller box instead so closely-spaced dots still get counted separately.
+    let template_size = TEMPLATE.size().expect("valid template size");
+    let suppress_size = Size::new(
+        (template_size.width / 2).max(1),
+        (template_size.height / 2).max(1),
+    );
+
+    detect_template_multiple_with_suppression(
+        &minimap_bgr,
+        &*TEMPLATE,
+        no_array(),
+        Point::default(),
+        MAX_ENEMIES,
+        0.7,
+        suppress_size,
+    )
+    .into_iter()
+    .filter_map(|result| result.ok())
+    .map(|(bbox, _)| bbox)
     .collect::<Vec<_>>()
 }
 
@@ -2735,15 +2925,44 @@ fn detect_template_multiple<T: ToInputArray + MatTraitConst>(
     max_matches: usize,
     threshold: f64,
 ) -> Vec<Result<(Rect, f64)>> {
+    let suppress_size = template.size().expect("valid template size");
+    detect_template_multiple_with_suppression(
+        mat,
+        template,
+        mask,
+        offset,
+        max_matches,
+        threshold,
+        suppress_size,
+    )
+}
+
+/// Same as [`detect_template_multiple`] but allows overriding the size of the box suppressed
+/// around each match to avoid re-matching the same instance, instead of always using the full
+/// template size.
+///
+/// A smaller `suppress_size` is useful when matches can legitimately sit close to or overlap each
+/// other (e.g. Monster Park's enemy dots) - suppressing a full template-sized box around each
+/// match can erase a second, genuinely distinct match before the search gets a chance to find it.
+#[inline]
+fn detect_template_multiple_with_suppression<T: ToInputArray + MatTraitConst>(
+    mat: &impl ToInputArray,
+    template: &T,
+    mask: impl ToInputArray,
+    offset: Point,
+    max_matches: usize,
+    threshold: f64,
+    suppress_size: Size,
+) -> Vec<Result<(Rect, f64)>> {
     #[inline]
-    fn clear_result(result: &mut Mat, loc: Point, template_size: Size) {
+    fn clear_result(result: &mut Mat, loc: Point, suppress_size: Size) {
         let cols = result.cols();
         let rows = result.rows();
 
         let x1 = loc.x.clamp(0, cols);
         let y1 = loc.y.clamp(0, rows);
-        let x2 = (loc.x + template_size.width).clamp(0, cols);
-        let y2 = (loc.y + template_size.height).clamp(0, rows);
+        let x2 = (loc.x + suppress_size.width).clamp(0, cols);
+        let y2 = (loc.y + suppress_size.height).clamp(0, rows);
 
         if x2 <= x1 || y2 <= y1 {
             return;
@@ -2810,7 +3029,7 @@ fn detect_template_multiple<T: ToInputArray + MatTraitConst>(
             break;
         }
 
-        clear_result(&mut result, loc, template_size);
+        clear_result(&mut result, loc, suppress_size);
         append_result(&mut matches, score, loc, offset, template_size);
     }
 

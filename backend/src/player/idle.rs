@@ -16,8 +16,9 @@ use crate::{
     ecs::Resources,
     minimap::Minimap,
     player::{
-        PlayerEntity, SolvingShape, exchange_booster::ExchangingBooster,
-        solve_violetta::SolvingVioletta, unstuck::Unstucking, use_booster::UsingBooster,
+        PlayerEntity, SolvingShape, enter_monster_park::EnteringMonsterPark,
+        exchange_booster::ExchangingBooster, solve_violetta::SolvingVioletta,
+        unstuck::Unstucking, use_booster::UsingBooster,
     },
     rng::Rng,
 };
@@ -218,6 +219,10 @@ fn update_from_action(
                 exchanging.amount,
                 exchanging.all,
             ));
+        }
+
+        Some(PlayerAction::EnterMonsterPark) => {
+            player.state = Player::EnteringMonsterPark(EnteringMonsterPark::new());
         }
 
         Some(PlayerAction::Unstuck) => {

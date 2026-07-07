@@ -26,6 +26,7 @@ use crate::{
     minimap::{Minimap, MinimapEntity},
     models::ActionKeyDirection,
     player::{
+        enter_monster_park::{EnteringMonsterPark, update_entering_monster_park_state},
         exchange_booster::{ExchangingBooster, update_exchanging_booster_state},
         fall::Falling,
         grapple::Grappling,
@@ -40,6 +41,7 @@ mod actions;
 mod adjust;
 mod cash_shop;
 mod double_jump;
+mod enter_monster_park;
 mod exchange_booster;
 mod fall;
 mod familiars_swap;
@@ -117,6 +119,7 @@ pub enum Player {
     Panicking(Panicking),
     UsingBooster(UsingBooster),
     ExchangingBooster(ExchangingBooster),
+    EnteringMonsterPark(EnteringMonsterPark),
 }
 
 impl Player {
@@ -156,6 +159,7 @@ impl Player {
             | Player::Panicking(_)
             | Player::UsingBooster(_)
             | Player::ExchangingBooster(_)
+            | Player::EnteringMonsterPark(_)
             | Player::SolvingShape(_)
             | Player::SolvingVioletta(_)
             | Player::Stalling(_, _) => false,
@@ -269,6 +273,7 @@ fn update_non_positional_state(
         }
         Player::UsingBooster(_) => update_using_booster_state(resources, player),
         Player::ExchangingBooster(_) => update_exchanging_booster_state(resources, player),
+        Player::EnteringMonsterPark(_) => update_entering_monster_park_state(resources, player),
         Player::Detecting
         | Player::Idle
         | Player::Moving(_, _, _)
@@ -308,6 +313,7 @@ fn update_positional_state(
         | Player::Panicking(_)
         | Player::UsingBooster(_)
         | Player::ExchangingBooster(_)
+        | Player::EnteringMonsterPark(_)
         | Player::SolvingShape(_)
         | Player::SolvingVioletta(_)
         | Player::CashShopThenExit(_) => unreachable!(),

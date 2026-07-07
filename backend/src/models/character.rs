@@ -13,6 +13,8 @@ pub struct Character {
     #[serde(skip_serializing, default)]
     pub id: Option<i64>,
     pub name: String,
+    #[serde(default = "level_default")]
+    pub level: u32,
     pub ropelift_key: Option<KeyBindingConfiguration>,
     pub teleport_key: Option<KeyBindingConfiguration>,
     #[serde(default)]
@@ -101,6 +103,7 @@ impl Default for Character {
         Self {
             id: None,
             name: String::new(),
+            level: level_default(),
             ropelift_key: None,
             teleport_key: None,
             blink_key: None,
@@ -160,6 +163,10 @@ impl Default for Character {
 
 fn feed_pet_count_default() -> u32 {
     3
+}
+
+fn level_default() -> u32 {
+    1
 }
 
 fn hexa_booster_exchange_amount_default() -> u32 {

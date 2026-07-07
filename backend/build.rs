@@ -42,6 +42,15 @@ fn main() {
     let cash_shop = resources_dir.join("cash_shop.png");
     let erda_shower = resources_dir.join("erda_shower_ideal_ratio.png");
     let portal = resources_dir.join("portal_ideal_ratio.png");
+    let monster_park_enemy = resources_dir.join("monster_park_enemy_ideal_ratio.png");
+    let monster_park_entry_map = resources_dir.join("entry_map_indicator.png");
+    let monster_park_ticket_label = resources_dir.join("monster_park_ticket_label_ideal_ratio.png");
+    let monster_park_free_clear_text =
+        resources_dir.join("monster_park_free_clear_text_ideal_ratio.png");
+    let monster_park_dungeon_locked =
+        resources_dir.join("monster_park_dungeon_locked_ideal_ratio.png");
+    let monster_park_enter_button =
+        resources_dir.join("monster_park_enter_button_ideal_ratio.png");
     let change_channel_menu = resources_dir.join("change_channel_menu_ideal_ratio.png");
     let admin = resources_dir.join("admin_ideal_ratio.png");
     let timer = resources_dir.join("timer_ideal_ratio.png");
@@ -254,6 +263,30 @@ fn main() {
     println!(
         "cargo:rustc-env=PORTAL_TEMPLATE={}",
         portal.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_ENEMY_TEMPLATE={}",
+        monster_park_enemy.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_ENTRY_MAP_TEMPLATE={}",
+        monster_park_entry_map.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_TICKET_LABEL_TEMPLATE={}",
+        monster_park_ticket_label.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_FREE_CLEAR_TEXT_TEMPLATE={}",
+        monster_park_free_clear_text.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_DUNGEON_LOCKED_TEMPLATE={}",
+        monster_park_dungeon_locked.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MONSTER_PARK_ENTER_BUTTON_TEMPLATE={}",
+        monster_park_enter_button.to_str().unwrap()
     );
     println!(
         "cargo:rustc-env=CHANGE_CHANNEL_MENU_TEMPLATE={}",

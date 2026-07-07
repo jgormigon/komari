@@ -260,6 +260,8 @@ pub enum PlayerAction {
     UseBooster(UseBooster),
     /// Exchange HEXA booster action.
     ExchangeBooster(ExchangeBooster),
+    /// Enters a Monster Park run from the entry lobby's gate.
+    EnterMonsterPark,
     /// Unstucking by pressing ESC.
     Unstuck,
 }
