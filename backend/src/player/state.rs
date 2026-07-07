@@ -19,6 +19,7 @@ use crate::{
     minimap::Minimap,
     notification::NotificationKind,
     player::{AUTO_MOB_USE_KEY_X_THRESHOLD, AUTO_MOB_USE_KEY_Y_THRESHOLD, AutoMob, Booster},
+    run::MS_PER_TICK,
     task::{Task, Update, update_detection_task},
 };
 
@@ -80,6 +81,23 @@ const UNSTUCK_COUNT_THRESHOLD: u32 = 6;
 
 /// The number of times [`Player::Unstucking`] can be transitioned to before entering GAMBA MODE.
 const UNSTUCK_GAMBA_MODE_COUNT: u32 = 3;
+
+/// The number of times GAMBA MODE can be entered without changing position before pressing
+/// [`PlayerConfiguration::blink_key`] as a last resort.
+const UNSTUCK_BLINK_COUNT: u32 = 2;
+
+/// The number of milliseconds the player's position must remain completely unchanged, regardless
+/// of the current [`Player`] state, before pressing [`PlayerConfiguration::blink_key`] as a
+/// watchdog.
+///
+/// Unlike [`UNSTUCK_COUNT_THRESHOLD`] and [`UNSTUCK_BLINK_COUNT`], this is not tied to
+/// [`Player::Moving`] repeatedly failing - it also covers cases where the bot ends up doing
+/// nothing at all (e.g. no action queued, or a state that never escalates through
+/// [`Player::Unstucking`]).
+const BLINK_WATCHDOG_MILLIS: u64 = 30_000;
+
+/// [`BLINK_WATCHDOG_MILLIS`] converted to ticks.
+const BLINK_WATCHDOG_TIMEOUT: u32 = (BLINK_WATCHDOG_MILLIS / MS_PER_TICK) as u32;
 
 /// The number of samples to store for approximating velocity.
 const VELOCITY_SAMPLES: usize = MOVE_TIMEOUT as usize;
@@ -200,6 +218,9 @@ pub struct PlayerConfiguration {
     pub grappling_key: Option<KeyKind>,
     /// The teleport key with [`None`] indicating double jump.
     pub teleport_key: Option<KeyKind>,
+    /// The `Blink` skill key used as a last resort in [`Player::Unstucking`] when GAMBA MODE
+    /// has repeatedly failed to change the player position.
+    pub blink_key: Option<KeyKind>,
     /// The jump key.
     ///
     /// Replaces the previously default [`KeyKind::Space`] key.
@@ -246,6 +267,7 @@ impl Default for PlayerConfiguration {
             interact_key: KeyKind::A,
             grappling_key: None,
             teleport_key: None,
+            blink_key: None,
             jump_key: KeyKind::A,
             up_jump_key: None,
             cash_shop_key: None,
@@ -361,6 +383,15 @@ pub struct PlayerContext {
     ///
     /// Resets when threshold reached or position changed.
     unstuck_transitioned_count: u32,
+    /// The number of times GAMBA MODE was entered.
+    ///
+    /// Resets when threshold reached or position changed.
+    unstuck_gamba_count: u32,
+    /// [`Timeout`] tracking how long the player's position has remained completely unchanged,
+    /// independent of the current [`Player`] state.
+    ///
+    /// Resets when the position changes. See [`BLINK_WATCHDOG_TIMEOUT`].
+    blink_watchdog_timeout: Timeout,
 
     /// The number of times [`Player::SolvingRune`] failed.
     rune_failed_count: u32,
@@ -617,6 +648,7 @@ impl PlayerContext {
         self.unstuck_count = 0;
         if include_transitioned_count {
             self.unstuck_transitioned_count = 0;
+            self.unstuck_gamba_count = 0;
         }
     }
 
@@ -697,6 +729,21 @@ impl PlayerContext {
         self.unstuck_transitioned_count += 1;
         if self.unstuck_transitioned_count >= UNSTUCK_GAMBA_MODE_COUNT {
             self.unstuck_transitioned_count = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Increments the GAMBA MODE counter.
+    ///
+    /// Returns `true` when [`Player::Unstucking`] should press
+    /// [`PlayerConfiguration::blink_key`] as a last resort.
+    #[inline]
+    pub(super) fn track_unstucking_gamba(&mut self) -> bool {
+        self.unstuck_gamba_count += 1;
+        if self.unstuck_gamba_count >= UNSTUCK_BLINK_COUNT {
+            self.unstuck_gamba_count = 0;
             true
         } else {
             false
@@ -1330,9 +1377,12 @@ impl PlayerContext {
         if last_known_pos != pos {
             self.unstuck_count = 0;
             self.unstuck_transitioned_count = 0;
+            self.unstuck_gamba_count = 0;
             self.is_stationary_timeout = Timeout::default();
+            self.blink_watchdog_timeout = Timeout::default();
         }
         self.update_velocity(pos, resources.tick);
+        self.update_blink_watchdog(resources);
 
         let (is_stationary, is_stationary_timeout) =
             match next_timeout_lifecycle(self.is_stationary_timeout, STATIONARY_TIMEOUT) {
@@ -1344,6 +1394,39 @@ impl PlayerContext {
         self.is_stationary_timeout = is_stationary_timeout;
         self.last_known_pos = Some(pos);
         true
+    }
+
+    /// Presses [`PlayerConfiguration::blink_key`] once the player's position has remained
+    /// completely unchanged for [`BLINK_WATCHDOG_TIMEOUT`] ticks, regardless of the current
+    /// [`Player`] state.
+    ///
+    /// This is a watchdog of last resort for cases where the bot ends up doing nothing at all
+    /// (e.g. no action queued, or stuck in a state that never escalates through
+    /// [`Player::Unstucking`]) rather than actively but unsuccessfully trying to move. Does
+    /// nothing while the bot is halted so paused time is not counted and does not trigger a
+    /// press right after resuming.
+    #[inline]
+    fn update_blink_watchdog(&mut self, resources: &mut Resources) {
+        if resources.operation.halting() {
+            return;
+        }
+
+        self.blink_watchdog_timeout = match next_timeout_lifecycle(
+            self.blink_watchdog_timeout,
+            BLINK_WATCHDOG_TIMEOUT,
+        ) {
+            Lifecycle::Started(timeout) | Lifecycle::Updated(timeout) => timeout,
+            Lifecycle::Ended => {
+                info!(
+                    target: "backend/player",
+                    "player position unchanged for {BLINK_WATCHDOG_MILLIS}ms, blink watchdog triggered"
+                );
+                if let Some(key) = self.config.blink_key {
+                    resources.input.send_key(key);
+                }
+                Timeout::default()
+            }
+        };
     }
 
     /// Approximates the player velocity.
@@ -1567,13 +1650,17 @@ fn auto_mob_ignore_xs_range_value(x: i32) -> (Range<i32>, u32) {
 mod tests {
     use std::{assert_matches::assert_matches, collections::HashMap};
 
+    use mockall::predicate::eq;
     use opencv::core::{Point, Rect};
 
+    use super::{BLINK_WATCHDOG_TIMEOUT, PlayerConfiguration, Timeout};
     use crate::{
         Position,
         array::Array,
+        bridge::{KeyKind, MockInput},
         ecs::Resources,
         minimap::{Minimap, MinimapIdle},
+        operation::OperationState,
         pathing::{Platform, find_neighbors},
         player::{AutoMob, PlayerAction, PlayerContext, Quadrant},
         rng::Rng,
@@ -1790,5 +1877,55 @@ mod tests {
         assert_eq!(point.x, 37);
         assert_eq!(point.y, 20); // 100 - 80
         assert_matches!(state.auto_mob_last_quadrant, Some(Quadrant::BottomLeft));
+    }
+
+    #[test]
+    fn update_blink_watchdog_presses_blink_key_when_timeout_ends() {
+        let mut keys = MockInput::new();
+        keys.expect_send_key().with(eq(KeyKind::Q)).once();
+        let mut resources = Resources::new(Some(keys), None);
+        let mut state = PlayerContext {
+            config: PlayerConfiguration {
+                blink_key: Some(KeyKind::Q),
+                ..Default::default()
+            },
+            blink_watchdog_timeout: Timeout {
+                current: BLINK_WATCHDOG_TIMEOUT,
+                total: BLINK_WATCHDOG_TIMEOUT,
+                started: true,
+            },
+            ..Default::default()
+        };
+
+        state.update_blink_watchdog(&mut resources);
+
+        // Timeout restarts so the watchdog can fire again if still stuck afterward
+        assert_eq!(state.blink_watchdog_timeout, Timeout::default());
+    }
+
+    #[test]
+    fn update_blink_watchdog_does_nothing_while_halting() {
+        let mut keys = MockInput::new();
+        keys.expect_send_key().never();
+        let mut resources = Resources::new(Some(keys), None);
+        resources.operation.state = OperationState::Halting;
+        let stuck_timeout = Timeout {
+            current: BLINK_WATCHDOG_TIMEOUT,
+            total: BLINK_WATCHDOG_TIMEOUT,
+            started: true,
+        };
+        let mut state = PlayerContext {
+            config: PlayerConfiguration {
+                blink_key: Some(KeyKind::Q),
+                ..Default::default()
+            },
+            blink_watchdog_timeout: stuck_timeout,
+            ..Default::default()
+        };
+
+        state.update_blink_watchdog(&mut resources);
+
+        // Halted, so the timeout must not advance or fire
+        assert_eq!(state.blink_watchdog_timeout, stuck_timeout);
     }
 }

@@ -680,6 +680,19 @@ fn SectionOthers() -> Element {
     rsx! {
         Section { title: "Others",
             div { class: "grid grid-cols-[auto_auto_128px] gap-4",
+                CharactersNumberU32Input {
+                    label: "Level",
+                    disabled: disabled(),
+                    on_value: move |level| {
+                        save_character(Character {
+                            level,
+                            ..character.peek().clone()
+                        });
+                    },
+                    value: character().level,
+                }
+                div {}
+                div {}
                 CharactersMillisInput {
                     label: "Link key timing",
                     disabled: disabled(),

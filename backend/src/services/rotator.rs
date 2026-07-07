@@ -45,6 +45,7 @@ impl RotatorService for DefaultRotatorService {
     }
 
     fn update_from_characters(&mut self, character: Option<&Character>) {
+        self.args.character_level = character.map(|character| character.level).unwrap_or(1);
         self.args.character_actions = character.map(actions_from).unwrap_or_default();
         self.args.buffs = character.map(buffs_from).unwrap_or_default();
         self.args.familiars = character

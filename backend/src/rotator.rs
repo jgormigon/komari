@@ -137,12 +137,19 @@ pub enum RotatorMode {
     StartToEndThenReverse,
     AutoMobbing(MobbingKey, Bound),
     PingPong(MobbingKey, Bound),
+    /// Sweeps the current Monster Park stage for mobs and advances through its portal.
+    ///
+    /// Whether the current map is instead Monster Park's entry lobby - in which case a gate is
+    /// navigated to and a dungeon is selected/entered instead of sweeping - is detected
+    /// on-screen at runtime rather than tracked here, since the entry lobby is identifiable
+    /// purely by a fixed visual landmark and doesn't need per-map configuration.
     MonsterPark(MobbingKey, Bound),
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RotatorBuildArgs {
     pub mode: RotatorMode,
+    pub character_level: u32,
     pub character_actions: Vec<Action>,
     pub map_actions: Vec<Action>,
     pub buffs: Vec<(BuffKind, KeyKind)>,
@@ -167,6 +174,9 @@ pub struct RotatorBuildArgs {
 pub trait Rotator: Debug + 'static {
     #[cfg_attr(test, concretize)]
     fn build_actions(&mut self, args: RotatorBuildArgs);
+
+    /// The currently built [`RotatorMode`].
+    fn mode(&self) -> RotatorMode;
 
     /// Resets priority and normal actions queues.
     ///
@@ -196,6 +206,9 @@ pub struct DefaultRotator {
     normal_actions_backward: bool,
     normal_actions_reset_on_erda: bool,
     normal_rotate_mode: RotatorMode,
+    /// The character's configured level, used by [`DefaultRotator::rotate_monster_park_entry`]
+    /// to decide which gate to use.
+    character_level: u32,
 
     /// The [`Task`] used when [`Self::normal_rotate_mode`] is [`RotatorMode::AutoMobbing`]
     auto_mob_task: Option<Task<Result<Vec<Point>>>>,
@@ -204,6 +217,41 @@ pub struct DefaultRotator {
     /// This limits the number of detections can be done inside the same quad as to help player
     /// advances to the next quad.
     auto_mob_quadrant_consecutive_count: Option<(Quadrant, u32)>,
+    /// Tracks the number of consecutive ticks [`DefaultRotator::rotate_monster_park`] detected no
+    /// enemies on the minimap.
+    ///
+    /// A single tick's detection can miss enemies that are actually still there (e.g. transient
+    /// capture noise, dots overlapping), so this requires several consecutive empty detections
+    /// before concluding the map is actually clear and it's time to head to the portal. Resets to
+    /// 0 as soon as any enemy is detected again.
+    monster_park_no_enemy_count: u32,
+    /// The last successfully detected portal Rect for [`DefaultRotator::rotate_monster_park`].
+    ///
+    /// The portal is detected fresh every tick rather than through the sticky minimap cache (see
+    /// that function for why), but once the player is standing on/near it, their own minimap
+    /// marker can visually overlap and occlude the portal icon, making it briefly undetectable
+    /// right when it's needed most. Falling back to the last known position for a few ticks
+    /// tolerates that without reintroducing staleness across a real map change - it's cleared as
+    /// soon as any enemy is detected again, which reliably happens at the start of sweeping a new
+    /// map.
+    monster_park_last_portal: Option<Rect>,
+    /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park`] has pressed
+    /// Up while standing at the portal without the map actually changing.
+    ///
+    /// A real map transition always resets Monster Park's state via [`Self::reset_queue`] (see
+    /// [`Self::monster_park_no_enemy_count`]), so if this keeps climbing it means the last Up
+    /// press genuinely isn't advancing the map - most likely because the "no enemies left" call
+    /// was wrong (e.g. the player's own minimap marker was occluding a still-alive enemy's dot)
+    /// rather than an actual portal-usage failure. Past [`MONSTER_PARK_PORTAL_ATTEMPT_LIMIT`],
+    /// give up pressing Up and go back to re-scanning for enemies instead of retrying forever.
+    monster_park_portal_attempts: u32,
+    /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park_entry`] has
+    /// pressed Up while standing at the entry gate without the dungeon-select dialog appearing.
+    ///
+    /// Mirrors [`Self::monster_park_portal_attempts`]'s reasoning: past
+    /// [`MONSTER_PARK_GATE_ATTEMPT_LIMIT`], stop pressing Up and re-verify the player's position
+    /// instead of retrying forever.
+    monster_park_gate_attempts: u32,
 
     priority_actions: OrderedHashMap<u32, PriorityAction>,
     /// The currently executing [`RotatorAction::Linked`] action
@@ -568,13 +616,17 @@ impl DefaultRotator {
         let bound = bound.into();
 
         let name = player_context.name();
-        let Update::Ok(points) =
-            update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
+        let points =
+            match update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
                 detector.detect_mobs(idle.bbox, bound, pos, name)
-            })
-        else {
-            return;
-        };
+            }) {
+                Update::Ok(points) => points,
+                Update::Err(err) => {
+                    debug!(target: "backend/rotator", "auto mob detection failed: {err:?}");
+                    return;
+                }
+                Update::Pending => return,
+            };
         let points = points
             .iter()
             .filter_map(|point| {
@@ -667,7 +719,7 @@ impl DefaultRotator {
         player_context: &mut PlayerContext,
         minimap_state: Minimap,
         key: MobbingKey,
-        bound: Bound,
+        _bound: Bound,
     ) {
         // First check if player has a normal action, if so, let it complete
         if player_context.has_normal_action() {
@@ -679,6 +731,35 @@ impl DefaultRotator {
             return;
         }
 
+        // After the final stage, a reward dialog (e.g. Spiegelmann's Monster Park completion
+        // screen) blocks the player until dismissed. Detect its Next/End Chat button and press
+        // the interact key to progress past it, instead of endlessly waiting for mobs or a
+        // portal that no longer exist once the run is actually over.
+        if resources
+            .detector()
+            .detect_popup_dialog_continue_button()
+            .is_ok()
+        {
+            let key = Key {
+                key: player_context.config.interact_key,
+                key_hold_ticks: 0,
+                key_hold_buffered_to_wait_after: false,
+                link_key: LinkKeyKind::None,
+                count: 1,
+                position: None,
+                direction: ActionKeyDirection::Any,
+                with: ActionKeyWith::Stationary,
+                wait_before_use_ticks: 5,
+                wait_before_use_ticks_random_range: 0,
+                wait_after_use_ticks: 0,
+                wait_after_use_ticks_random_range: 0,
+                wait_after_buffered: WaitAfterBuffered::None,
+            };
+            player_context.set_priority_action(None, PlayerAction::Key(key));
+            debug!(target: "backend/rotator", "Monster Park: reward dialog detected, pressing interact key");
+            return;
+        }
+
         let Minimap::Idle(idle) = minimap_state else {
             return;
         };
@@ -686,74 +767,29 @@ impl DefaultRotator {
             return;
         };
 
-        let bound_rect = bound.into();
-
-        // Check for mobs first
-        let name = player_context.name();
-        let Update::Ok(mob_points) =
-            update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
-                detector.detect_mobs(idle.bbox, bound_rect, pos, name)
+        // Monster Park shows every remaining enemy as a red dot directly on the minimap, so
+        // their position is ground truth - unlike regular auto mobbing there is no need for
+        // camera-based mob detection, reachable-y correction, or ignore-xs/quadrant exploration
+        // heuristics tied to a single map's geometry, none of which get reset across the several
+        // maps a Monster Park run moves through.
+        let enemies = resources
+            .detector()
+            .detect_minimap_monster_park_enemies(idle.bbox);
+        debug!(target: "backend/rotator", "Monster Park: detected {} enemy dot(s): {:?}", enemies.len(), enemies);
+        let nearest_enemy = enemies
+            .into_iter()
+            .map(|rect| {
+                // Flip coordinate to bottom-left, same convention as portals
+                let y = idle.bbox.height - rect.br().y;
+                Point::new(rect.x + rect.width / 2, y + rect.height / 2)
             })
-        else {
-            return;
-        };
+            .min_by_key(|point| (point.x - pos.x).pow(2) + (point.y - pos.y).pow(2));
 
-        // Filter and process mob points similar to auto mobbing
-        let mob_points: Vec<Point> = mob_points
-            .iter()
-            .filter_map(|point| {
-                let y = idle.bbox.height - point.y;
-                let point = if y <= pos.y || (y - pos.y).abs() <= GRAPPLING_THRESHOLD {
-                    Some(Point::new(point.x, y))
-                } else {
-                    None
-                };
-                point.and_then(|point| {
-                    player_context.auto_mob_pick_reachable_y_position(
-                        resources,
-                        minimap_state,
-                        point,
-                    )
-                })
-            })
-            .collect();
+        if let Some(point) = nearest_enemy {
+            self.monster_park_no_enemy_count = 0;
+            self.monster_park_last_portal = None;
+            self.monster_park_portal_attempts = 0;
 
-        // If mobs exist, use auto mobbing
-        if !mob_points.is_empty() {
-            // Reuse auto mobbing logic
-            let mut use_pathing_point = false;
-
-            if let Some(last_quad) = player_context.auto_mob_last_quadrant() {
-                if self
-                    .auto_mob_quadrant_consecutive_count
-                    .is_none_or(|(quad, _)| quad != last_quad)
-                {
-                    self.auto_mob_quadrant_consecutive_count = Some((last_quad, 0));
-                }
-                let (_, count) = self
-                    .auto_mob_quadrant_consecutive_count
-                    .as_mut()
-                    .expect("is some");
-
-                *count += 1;
-                if *count >= AUTO_MOB_SAME_QUAD_THRESHOLD {
-                    *count = 0;
-                    use_pathing_point = true;
-                }
-            }
-
-            let mut is_pathing = use_pathing_point;
-            let point = if use_pathing_point {
-                player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
-            } else {
-                resources
-                    .rng
-                    .random_choose(mob_points.into_iter())
-                    .unwrap_or_else(|| {
-                        is_pathing = true;
-                        player_context.auto_mob_pathing_point(resources, minimap_state, bound_rect)
-                    })
-            };
             let key_hold_ticks = (key.key_hold_millis / MS_PER_TICK) as u32;
             let wait_before_ticks = (key.wait_before_millis / MS_PER_TICK) as u32;
             let wait_before_ticks_random_range =
@@ -781,42 +817,119 @@ impl DefaultRotator {
                     wait_after_ticks,
                     wait_after_ticks_random_range,
                     position,
-                    is_pathing,
+                    is_pathing: false,
                 }),
             );
             return;
         }
 
-        // No mobs found, check for portals
-        let portals = idle.portals();
-        let Some(portal) = portals.iter().next() else {
+        // A single tick's detection can miss enemies that are actually still on the minimap
+        // (transient capture noise, dots overlapping each other), so require several consecutive
+        // empty detections before concluding the map is genuinely clear and it's time to look
+        // for the portal - otherwise a single flaky tick sends the player off mid-sweep.
+        const MONSTER_PARK_NO_ENEMY_DEBOUNCE_COUNT: u32 = 3;
+        self.monster_park_no_enemy_count = self.monster_park_no_enemy_count.saturating_add(1);
+        if self.monster_park_no_enemy_count < MONSTER_PARK_NO_ENEMY_DEBOUNCE_COUNT {
+            return;
+        }
+
+        // No enemies left on the minimap, check for portals. Detected fresh every tick instead
+        // of through `idle.portals()`, which is a cache designed to be sticky/debounced for a
+        // single stable map (it only drops a portal after several consecutive misses). On a
+        // Monster Park map transition that cache can keep reporting the previous map's
+        // now-irrelevant portal position - or never clear it at all, if consecutive stages share
+        // similar enough minimap chrome that the anchor-mismatch check that would normally
+        // invalidate it doesn't trip.
+        let detected_portal = resources
+            .detector()
+            .detect_minimap_portals(idle.bbox)
+            .into_iter()
+            .map(|rect| {
+                // Flip coordinate to bottom-left, same convention as enemies
+                let y = idle.bbox.height - rect.br().y;
+                Rect::new(rect.x, y, rect.width, rect.height)
+            })
+            .next();
+        if detected_portal.is_some() {
+            self.monster_park_last_portal = detected_portal;
+        }
+        // Once the player is standing on/near the portal, their own minimap marker can visually
+        // overlap and occlude the portal icon, making this tick's fresh detection come up empty
+        // right when it's needed most to recognize arrival. Fall back to the last position that
+        // was actually detected instead of immediately declaring the map complete (see the field
+        // doc comment for how this stays safe across a real map change).
+        let Some(portal) = detected_portal.or(self.monster_park_last_portal) else {
             // No portal found, Monster Park is complete for this map
-            debug!(target: "rotator", "Monster Park: No mobs and no portal found, map complete");
+            debug!(target: "backend/rotator", "Monster Park: No mobs and no portal found, map complete");
             return;
         };
 
         // Calculate portal center position
         // Portal coordinates are already in bottom-left coordinate system
+        //
+        // The portal icon's bounding box is consistently detected a few pixels above the ground
+        // the player actually needs to stand on (the icon's swirl graphic extends upward from its
+        // usable base), so its raw vertical center overshoots the real target height. Subtract
+        // that fixed offset so both the arrival check and movement targeting below aim at the
+        // actual reachable ground instead of a point slightly above it.
+        const PORTAL_GROUND_Y_OFFSET: i32 = 6;
         let portal_center_x = portal.x + portal.width / 2;
-        let portal_center_y = portal.y + portal.height / 2;
+        let portal_center_y = portal.y + portal.height / 2 - PORTAL_GROUND_Y_OFFSET;
         let portal_center = Point::new(portal_center_x, portal_center_y);
 
-        // Check if player is already at the portal
-        if idle.is_position_inside_portal(pos) {
-            // Player is at portal, press Up key to use it
-            let position = Position {
-                x: portal_center_x,
-                x_random_range: 0,
-                y: portal_center_y,
-                allow_adjusting: true,
-            };
+        // Check if player is already at the portal. `is_position_inside_portal` uses the
+        // detected portal Rect, which is padded well beyond the icon itself (see
+        // PORTAL_EXPAND_SIZE) - that was letting this branch fire while the player was still
+        // several pixels short of the portal's actual usable spot, wasting Up presses that
+        // don't do anything. Require being genuinely close to the portal's center instead.
+        //
+        // The portal icon's detected height can also be off by a handful of pixels from the
+        // player's actual reachable ground height (icon padding/centering imprecision). Left
+        // alone, that was making the move step below ask for a short jump to close a "gap" that
+        // isn't really there - since there's no real ledge to land on, the jump doesn't change
+        // the player's height at all, so it retries the identical jump over and over until it
+        // hits the movement-repeat abort. Both checks below use the same tolerance so a height
+        // difference small enough to be treated as "same platform" when moving is also accepted
+        // as "arrived" once there, instead of asking to move and then refusing to call it close
+        // enough forever.
+        const PORTAL_ARRIVED_X_THRESHOLD: i32 = 1;
+        const PORTAL_Y_THRESHOLD: i32 = 8;
+        let is_at_portal = (pos.x - portal_center_x).abs() <= PORTAL_ARRIVED_X_THRESHOLD
+            && (pos.y - portal_center_y).abs() <= PORTAL_Y_THRESHOLD;
+
+        if is_at_portal {
+            // A real map transition always resets `monster_park_portal_attempts` back to 0 via
+            // `reset_queue` (triggered by the map-change event rebuilding the rotator). If Up has
+            // been pressed several times in a row while still reading as "at the portal" and that
+            // never happened, the map genuinely isn't changing - most likely because the earlier
+            // "no enemies left" conclusion was wrong (e.g. the player's own minimap marker was
+            // occluding a still-alive enemy's dot) rather than the Up press itself failing. Give
+            // up on the portal and re-scan for enemies instead of pressing Up forever.
+            const MONSTER_PARK_PORTAL_ATTEMPT_LIMIT: u32 = 5;
+            if self.monster_park_portal_attempts >= MONSTER_PARK_PORTAL_ATTEMPT_LIMIT {
+                debug!(
+                    target: "backend/rotator",
+                    "Monster Park: pressed Up {} times without the map changing, re-checking for enemies",
+                    self.monster_park_portal_attempts
+                );
+                self.monster_park_no_enemy_count = 0;
+                self.monster_park_last_portal = None;
+                self.monster_park_portal_attempts = 0;
+                return;
+            }
+            self.monster_park_portal_attempts += 1;
+
+            // Press Up in place instead of targeting the portal's detected center as a movement
+            // destination - a `position` here would route through Player::Moving first, and any
+            // remaining pixel of y mismatch is enough to cross the up-jump threshold and send
+            // the player jumping in place instead of using the portal.
             let key = Key {
                 key: KeyKind::Up,
                 key_hold_ticks: 0,
                 key_hold_buffered_to_wait_after: false,
                 link_key: LinkKeyKind::None,
                 count: 1,
-                position: Some(position),
+                position: None,
                 direction: ActionKeyDirection::Any,
                 with: ActionKeyWith::Stationary,
                 wait_before_use_ticks: 5,
@@ -826,13 +939,25 @@ impl DefaultRotator {
                 wait_after_buffered: WaitAfterBuffered::None,
             };
             player_context.set_priority_action(None, PlayerAction::Key(key));
-            debug!(target: "rotator", "Monster Park: Player at portal, pressing Up key");
+            debug!(target: "backend/rotator", "Monster Park: Player at portal, pressing Up key");
         } else {
-            // Player is not at portal, move towards it
+            // Not at the portal (yet, or pushed off it), so the attempt streak from a previous
+            // arrival no longer applies.
+            self.monster_park_portal_attempts = 0;
+
+            // Player is not at portal, move towards it. Only target the detected height when
+            // it's far enough from the player's current height to plausibly be a real platform
+            // change - otherwise just walk there horizontally at the player's current height,
+            // per the reasoning above.
+            let target_y = if (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD {
+                pos.y
+            } else {
+                portal_center_y
+            };
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
-                y: portal_center_y,
+                y: target_y,
                 allow_adjusting: true,
             };
             player_context.set_normal_action(
@@ -842,8 +967,68 @@ impl DefaultRotator {
                     wait_after_move_ticks: 0,
                 }),
             );
-            debug!(target: "rotator", "Monster Park: Moving to portal at {:?}", portal_center);
+            debug!(target: "backend/rotator", "Monster Park: Moving to portal at {:?} (target y {target_y})", portal_center);
         }
+    }
+
+    fn rotate_monster_park_entry(
+        &mut self,
+        player_context: &mut PlayerContext,
+        minimap_state: Minimap,
+    ) {
+        if player_context.has_normal_action() {
+            return;
+        }
+        if player_context.has_priority_action() {
+            return;
+        }
+
+        let Minimap::Idle(_) = minimap_state else {
+            return;
+        };
+        let Some(pos) = player_context.last_known_pos else {
+            return;
+        };
+
+        // Fixed gate x positions on Monster Park's entry lobby map. This hub's layout is static
+        // game content shared by everyone, not something users configure per grinding map, so
+        // these are hardcoded rather than read from a configurable bound like other modes.
+        const GATE_X_UNDER_LEVEL_260: i32 = 109;
+        const GATE_X_LEVEL_260_AND_ABOVE: i32 = 120;
+        const GATE_Y: i32 = 0;
+        const GATE_ARRIVED_THRESHOLD: i32 = 1;
+
+        let target_x = if self.character_level < 260 {
+            GATE_X_UNDER_LEVEL_260
+        } else {
+            GATE_X_LEVEL_260_AND_ABOVE
+        };
+        let is_at_gate = (pos.x - target_x).abs() <= GATE_ARRIVED_THRESHOLD
+            && (pos.y - GATE_Y).abs() <= GATE_ARRIVED_THRESHOLD;
+
+        if !is_at_gate {
+            let position = Position {
+                x: target_x,
+                x_random_range: 0,
+                y: GATE_Y,
+                allow_adjusting: true,
+            };
+            player_context.set_normal_action(
+                None,
+                PlayerAction::Move(Move {
+                    position,
+                    wait_after_move_ticks: 0,
+                }),
+            );
+            debug!(target: "backend/rotator", "Monster Park Entry: moving to gate at {:?}", position);
+            return;
+        }
+
+        // At the gate - hand off to `Player::EnteringMonsterPark`, which presses Up and drives
+        // the whole dungeon-select dialog from here. This rotator's job stops at getting the
+        // player to the right spot.
+        player_context.set_priority_action(None, PlayerAction::EnterMonsterPark);
+        debug!(target: "backend/rotator", "Monster Park Entry: at gate, entering Monster Park");
     }
 
     fn rotate_ping_pong(
@@ -998,11 +1183,17 @@ impl DefaultRotator {
 }
 
 impl Rotator for DefaultRotator {
+    #[inline]
+    fn mode(&self) -> RotatorMode {
+        self.normal_rotate_mode
+    }
+
     #[cfg_attr(test, concretize)]
     fn build_actions(&mut self, args: RotatorBuildArgs) {
         info!(target: "backend/rotator", "preparing actions {args:?}");
         let RotatorBuildArgs {
             mode,
+            character_level,
             character_actions,
             map_actions,
             buffs,
@@ -1024,18 +1215,26 @@ impl Rotator for DefaultRotator {
         self.reset_queue();
         self.normal_actions.clear();
         self.normal_rotate_mode = mode;
+        self.character_level = character_level;
         self.normal_actions_reset_on_erda = enable_reset_normal_actions_on_erda;
         self.priority_actions.clear();
 
+        // Monster Park is a tight, timed sweep-then-portal loop across several maps - buffs,
+        // boosters and Erda Shower off-cooldown actions are disruptive there (e.g. stopping to
+        // cast mid-sweep, or having to re-detect them fresh in every new map) and not worth
+        // interrupting the loop for, so this mode (including its entry lobby) ignores them
+        // entirely.
+        let is_monster_park = matches!(mode, RotatorMode::MonsterPark(_, _));
+
         // Low priority
-        if enable_using_generic_booster {
+        if enable_using_generic_booster && !is_monster_park {
             self.priority_actions.insert(
                 next_action_id(),
                 use_booster_priority_action(Booster::Generic),
             );
         }
 
-        if enable_using_hexa_booster {
+        if enable_using_hexa_booster && !is_monster_park {
             self.priority_actions
                 .insert(next_action_id(), use_booster_priority_action(Booster::Hexa));
         }
@@ -1083,11 +1282,19 @@ impl Rotator for DefaultRotator {
             // infinite loop due to auto mobbing ignoring Any condition
             i += offset;
             match condition {
-                ActionCondition::EveryMillis(_) | ActionCondition::ErdaShowerOffCooldown => {
+                ActionCondition::EveryMillis(_) => {
                     self.priority_actions.insert(
                         next_action_id(),
                         priority_action(action, condition, queue_to_front),
                     );
+                }
+                ActionCondition::ErdaShowerOffCooldown => {
+                    if !is_monster_park {
+                        self.priority_actions.insert(
+                            next_action_id(),
+                            priority_action(action, condition, queue_to_front),
+                        );
+                    }
                 }
                 ActionCondition::Any => {
                     if matches!(self.normal_rotate_mode, RotatorMode::AutoMobbing(_, _)) {
@@ -1143,9 +1350,11 @@ impl Rotator for DefaultRotator {
                 familiar_essence_replenish_priority_action(familiar_essence_key),
             );
         }
-        for (i, key) in buffs.iter().copied() {
-            self.priority_actions
-                .insert(next_action_id(), buff_priority_action(i, key));
+        if !is_monster_park {
+            for (i, key) in buffs.iter().copied() {
+                self.priority_actions
+                    .insert(next_action_id(), buff_priority_action(i, key));
+            }
         }
 
         self.priority_actions
@@ -1160,6 +1369,10 @@ impl Rotator for DefaultRotator {
         self.priority_queuing_linked_action = None;
         self.auto_mob_task = None;
         self.auto_mob_quadrant_consecutive_count = None;
+        self.monster_park_no_enemy_count = 0;
+        self.monster_park_last_portal = None;
+        self.monster_park_portal_attempts = 0;
+        self.monster_park_gate_attempts = 0;
     }
 
     #[inline]
@@ -1195,13 +1408,19 @@ impl Rotator for DefaultRotator {
             RotatorMode::PingPong(key, bound) => {
                 self.rotate_ping_pong(&mut world.player.context, world.minimap.state, key, bound)
             }
-            RotatorMode::MonsterPark(key, bound) => self.rotate_monster_park(
-                resources,
-                &mut world.player.context,
-                world.minimap.state,
-                key,
-                bound,
-            ),
+            RotatorMode::MonsterPark(key, bound) => {
+                if resources.detector().detect_monster_park_entry_map() {
+                    self.rotate_monster_park_entry(&mut world.player.context, world.minimap.state)
+                } else {
+                    self.rotate_monster_park(
+                        resources,
+                        &mut world.player.context,
+                        world.minimap.state,
+                        key,
+                        bound,
+                    )
+                }
+            }
         }
     }
 }
@@ -1953,6 +2172,7 @@ mod tests {
         let buffs = vec![(BuffKind::Rune, KeyKind::A); 4];
         let args = RotatorBuildArgs {
             mode: RotatorMode::default(),
+            character_level: 1,
             map_actions: actions,
             character_actions: vec![],
             buffs,

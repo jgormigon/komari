@@ -11,7 +11,11 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 enum UnstuckingKind {
     Esc,
-    Movement { timeout: Timeout, random: bool },
+    Movement {
+        timeout: Timeout,
+        random: bool,
+        blink: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,14 +30,22 @@ impl Unstucking {
         }
     }
 
-    pub fn new_movement(timeout: Timeout, random: bool) -> Self {
+    pub fn new_movement(timeout: Timeout, random: bool, blink: bool) -> Self {
         Self {
-            kind: UnstuckingKind::Movement { timeout, random },
+            kind: UnstuckingKind::Movement {
+                timeout,
+                random,
+                blink,
+            },
         }
     }
 
-    fn movement(mut self, timeout: Timeout, random: bool) -> Unstucking {
-        self.kind = UnstuckingKind::Movement { timeout, random };
+    fn movement(mut self, timeout: Timeout, random: bool, blink: bool) -> Unstucking {
+        self.kind = UnstuckingKind::Movement {
+            timeout,
+            random,
+            blink,
+        };
         self
     }
 }
@@ -55,7 +67,10 @@ const Y_IGNORE_THRESHOLD: i32 = 18;
 ///
 /// Each initial transition to [`Player::Unstucking`] increases
 /// the [`PlayerState::unstuck_consecutive_counter`] by one. If the threshold is reached, this
-/// state will just jump in random direction.
+/// state will just jump in random direction (GAMBA MODE). If GAMBA MODE itself keeps being
+/// entered without the player position changing (e.g. the player wandered off the minimap
+/// entirely and normal movement cannot recover it), it will additionally press
+/// [`PlayerConfiguration::blink_key`], if configured, as a last resort.
 pub fn update_unstucking_state(
     resources: &mut Resources,
     player: &mut PlayerEntity,
@@ -64,30 +79,39 @@ pub fn update_unstucking_state(
     let Player::Unstucking(unstucking) = player.state else {
         panic!("state is not unstucking");
     };
+
+    // A blocking dialog/menu (e.g. the change-channel popup) can itself prevent the minimap
+    // from being detected, so this must run before the `Minimap::Idle` check below instead of
+    // being gated behind it - otherwise it would never get a chance to dismiss the very thing
+    // that is blocking detection. This also applies regardless of `UnstuckingKind`: the bot can
+    // land here from automatic stuck detection (`Movement`) just as easily as from an explicit
+    // `Unstuck` action (`Esc`), and a leftover dialog can be the actual cause of being stuck.
+    if resources.detector().detect_esc_settings()
+        || resources.detector().detect_change_channel_menu_opened()
+    {
+        resources.input.send_key(KeyKind::Esc);
+    }
+
     let Minimap::Idle(idle) = minimap_state else {
         player.state = Player::Detecting;
         return;
     };
 
     match unstucking.kind {
-        UnstuckingKind::Esc => {
-            if resources.detector().detect_esc_settings()
-                || resources.detector().detect_change_channel_menu_opened()
-            {
-                resources.input.send_key(KeyKind::Esc);
+        UnstuckingKind::Esc => match next_action(&player.context) {
+            Some(PlayerAction::Unstuck) => {
+                player.context.clear_action_completed();
+                player.state = Player::Detecting;
             }
-
-            match next_action(&player.context) {
-                Some(PlayerAction::Unstuck) => {
-                    player.context.clear_action_completed();
-                    player.state = Player::Detecting;
-                }
-                Some(_) | None => {
-                    player.state = Player::Detecting;
-                }
+            Some(_) | None => {
+                player.state = Player::Detecting;
             }
-        }
-        UnstuckingKind::Movement { timeout, random } => {
+        },
+        UnstuckingKind::Movement {
+            timeout,
+            random,
+            blink,
+        } => {
             let context = &mut player.context;
             let pos = context
                 .last_known_pos
@@ -96,10 +120,15 @@ pub fn update_unstucking_state(
 
             match next_timeout_lifecycle(timeout, MOVE_TIMEOUT) {
                 Lifecycle::Started(timeout) => {
+                    if blink && let Some(key) = context.config.blink_key {
+                        resources.input.send_key(key);
+                    }
+
                     let to_right = match (random, pos) {
                         (true, _) => resources.rng.random_bool(0.5),
                         (_, Some(Point { y, .. })) if y <= Y_IGNORE_THRESHOLD => {
-                            player.state = Player::Unstucking(unstucking.movement(timeout, random));
+                            player.state =
+                                Player::Unstucking(unstucking.movement(timeout, random, blink));
                             return;
                         }
                         (_, Some(Point { x, .. })) => x <= idle.bbox.width / 2,
@@ -111,7 +140,7 @@ pub fn update_unstucking_state(
                         resources.input.send_key_up(KeyKind::Left);
                     }
 
-                    player.state = Player::Unstucking(unstucking.movement(timeout, random));
+                    player.state = Player::Unstucking(unstucking.movement(timeout, random, blink));
                 }
                 Lifecycle::Ended => {
                     resources.input.send_key_up(KeyKind::Right);
@@ -128,7 +157,7 @@ pub fn update_unstucking_state(
                         resources.input.send_key(context.config.jump_key);
                     }
 
-                    player.state = Player::Unstucking(unstucking.movement(timeout, random));
+                    player.state = Player::Unstucking(unstucking.movement(timeout, random, blink));
                 }
             }
         }

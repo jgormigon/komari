@@ -61,6 +61,8 @@ runs:
     - uses: cargo-bins/cargo-binstall@main
     - name: Install Dioxus CLI
       shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       run: cargo binstall dioxus-cli@0.7.2 --no-confirm
 
     - name: Install protoc
