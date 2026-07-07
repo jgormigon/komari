@@ -1411,20 +1411,22 @@ impl PlayerContext {
             return;
         }
 
-        self.blink_watchdog_timeout =
-            match next_timeout_lifecycle(self.blink_watchdog_timeout, BLINK_WATCHDOG_TIMEOUT) {
-                Lifecycle::Started(timeout) | Lifecycle::Updated(timeout) => timeout,
-                Lifecycle::Ended => {
-                    info!(
-                        target: "backend/player",
-                        "player position unchanged for {BLINK_WATCHDOG_MILLIS}ms, blink watchdog triggered"
-                    );
-                    if let Some(key) = self.config.blink_key {
-                        resources.input.send_key(key);
-                    }
-                    Timeout::default()
+        self.blink_watchdog_timeout = match next_timeout_lifecycle(
+            self.blink_watchdog_timeout,
+            BLINK_WATCHDOG_TIMEOUT,
+        ) {
+            Lifecycle::Started(timeout) | Lifecycle::Updated(timeout) => timeout,
+            Lifecycle::Ended => {
+                info!(
+                    target: "backend/player",
+                    "player position unchanged for {BLINK_WATCHDOG_MILLIS}ms, blink watchdog triggered"
+                );
+                if let Some(key) = self.config.blink_key {
+                    resources.input.send_key(key);
                 }
-            };
+                Timeout::default()
+            }
+        };
     }
 
     /// Approximates the player velocity.

@@ -17,8 +17,8 @@ use crate::{
     minimap::Minimap,
     player::{
         PlayerEntity, SolvingShape, enter_monster_park::EnteringMonsterPark,
-        exchange_booster::ExchangingBooster, solve_violetta::SolvingVioletta,
-        unstuck::Unstucking, use_booster::UsingBooster,
+        exchange_booster::ExchangingBooster, solve_violetta::SolvingVioletta, unstuck::Unstucking,
+        use_booster::UsingBooster,
     },
     rng::Rng,
 };

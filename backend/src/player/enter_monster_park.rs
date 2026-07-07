@@ -143,7 +143,9 @@ fn update_selecting_dungeon(resources: &mut Resources, entering: &mut EnteringMo
                 .detect_monster_park_locked_dungeon_tiles();
             let point = last_active_dungeon_tile(&locked_tiles, ticket_label);
 
-            resources.input.send_mouse(point.x, point.y, MouseKind::Click);
+            resources
+                .input
+                .send_mouse(point.x, point.y, MouseKind::Click);
             entering.state = State::SelectingDungeon(timeout, ticket_label);
         }
         Lifecycle::Ended => {

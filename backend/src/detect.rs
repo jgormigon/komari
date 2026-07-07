@@ -964,8 +964,11 @@ fn detect_popup_end_chat_button(
 
 fn detect_monster_park_entry_map(bgr: &impl ToInputArray) -> bool {
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(include_bytes!(env!("MONSTER_PARK_ENTRY_MAP_TEMPLATE")), IMREAD_COLOR)
-            .unwrap()
+        imgcodecs::imdecode(
+            include_bytes!(env!("MONSTER_PARK_ENTRY_MAP_TEMPLATE")),
+            IMREAD_COLOR,
+        )
+        .unwrap()
     });
 
     detect_template(bgr, &*TEMPLATE, Point::default(), 0.75).is_ok()
@@ -993,7 +996,12 @@ fn detect_monster_park_ticket_count(
     const NUMBER_WIDTH: i32 = 68;
 
     let label = detect_monster_park_ticket_label(grayscale)?;
-    let number_bbox = Rect::new(label.x + NUMBER_X_OFFSET, label.y, NUMBER_WIDTH, label.height);
+    let number_bbox = Rect::new(
+        label.x + NUMBER_X_OFFSET,
+        label.y,
+        NUMBER_WIDTH,
+        label.height,
+    );
 
     extract_texts(bgr, &[number_bbox])
         .first()
@@ -1307,7 +1315,9 @@ fn detect_minimap_portals<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Ve
     .collect::<Vec<_>>()
 }
 
-fn detect_minimap_monster_park_enemies<T: MatTraitConst + ToInputArray>(minimap_bgr: T) -> Vec<Rect> {
+fn detect_minimap_monster_park_enemies<T: MatTraitConst + ToInputArray>(
+    minimap_bgr: T,
+) -> Vec<Rect> {
     /// TODO: Support default ratio
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
         imgcodecs::imdecode(

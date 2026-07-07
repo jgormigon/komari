@@ -49,8 +49,7 @@ fn main() {
         resources_dir.join("monster_park_free_clear_text_ideal_ratio.png");
     let monster_park_dungeon_locked =
         resources_dir.join("monster_park_dungeon_locked_ideal_ratio.png");
-    let monster_park_enter_button =
-        resources_dir.join("monster_park_enter_button_ideal_ratio.png");
+    let monster_park_enter_button = resources_dir.join("monster_park_enter_button_ideal_ratio.png");
     let change_channel_menu = resources_dir.join("change_channel_menu_ideal_ratio.png");
     let admin = resources_dir.join("admin_ideal_ratio.png");
     let timer = resources_dir.join("timer_ideal_ratio.png");

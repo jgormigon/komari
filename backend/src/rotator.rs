@@ -616,19 +616,17 @@ impl DefaultRotator {
         let bound = bound.into();
 
         let name = player_context.name();
-        let points = match update_detection_task(
-            resources,
-            0,
-            &mut self.auto_mob_task,
-            move |detector| detector.detect_mobs(idle.bbox, bound, pos, name),
-        ) {
-            Update::Ok(points) => points,
-            Update::Err(err) => {
-                debug!(target: "backend/rotator", "auto mob detection failed: {err:?}");
-                return;
-            }
-            Update::Pending => return,
-        };
+        let points =
+            match update_detection_task(resources, 0, &mut self.auto_mob_task, move |detector| {
+                detector.detect_mobs(idle.bbox, bound, pos, name)
+            }) {
+                Update::Ok(points) => points,
+                Update::Err(err) => {
+                    debug!(target: "backend/rotator", "auto mob detection failed: {err:?}");
+                    return;
+                }
+                Update::Pending => return,
+            };
         let points = points
             .iter()
             .filter_map(|point| {
