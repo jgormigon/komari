@@ -21,7 +21,11 @@ use crate::{
 pub const AUTO_MOB_USE_KEY_X_THRESHOLD: i32 = 16;
 
 /// The minimum y distance required to transition to [`Player::UseKey`] in auto mob action.
-pub const AUTO_MOB_USE_KEY_Y_THRESHOLD: i32 = 8;
+///
+/// This must stay below `JUMPABLE_RANGE`'s lower bound (see `moving.rs`) so the player never
+/// decides it is "close enough to attack" while still in a gap that actually requires jumping
+/// to close - otherwise the attack key gets pressed at a mob that is still out of reach.
+pub const AUTO_MOB_USE_KEY_Y_THRESHOLD: i32 = 3;
 
 /// Represents the fixed key action.
 ///

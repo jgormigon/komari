@@ -330,7 +330,17 @@ pub fn update_moving_state(
     }
 
     // Check to up jump
-    if !skip_destination && y_direction > 0 && y_distance >= UP_JUMP_THRESHOLD {
+    //
+    // In auto mob, the up jump threshold is lowered to the start of `JUMPABLE_RANGE` so that a
+    // small upward gap to the mob always goes through a real climb (up jump / teleport) instead
+    // of falling into the plain in-place `Player::Jumping` below, which presses the jump key
+    // without holding a direction and so does not reliably gain height.
+    let up_jump_threshold = if context.has_auto_mob_action_only() {
+        JUMPABLE_RANGE.start
+    } else {
+        UP_JUMP_THRESHOLD
+    };
+    if !skip_destination && y_direction > 0 && y_distance >= up_jump_threshold {
         // In auto mob with platforms pathing and up jump only, immediately aborts the action
         // if there are no intermediate points and the distance is too big to up jump.
         if context.has_auto_mob_action_only()
@@ -350,7 +360,14 @@ pub fn update_moving_state(
     }
 
     // Check to jump
-    if !skip_destination && y_direction > 0 && JUMPABLE_RANGE.contains(&y_distance) {
+    //
+    // Skipped in auto mob since the up jump check above already claims the whole
+    // `JUMPABLE_RANGE` there.
+    if !skip_destination
+        && !context.has_auto_mob_action_only()
+        && y_direction > 0
+        && JUMPABLE_RANGE.contains(&y_distance)
+    {
         return abort_action_on_state_repeat(player, Player::Jumping(moving), minimap_state);
     }
 
