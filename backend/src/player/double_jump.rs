@@ -275,7 +275,7 @@ fn update_from_action(
 ) {
     let cur_pos = moving.pos;
     let (x_distance, x_direction) = moving.x_distance_direction_from(false, cur_pos);
-    let (y_distance, _) = moving.y_distance_direction_from(false, cur_pos);
+    let (y_distance, y_direction) = moving.y_distance_direction_from(false, cur_pos);
     let double_jumped_or_flying = player.context.velocity.0 > X_VELOCITY_THRESHOLD;
 
     match next_action(&player.context) {
@@ -294,6 +294,7 @@ fn update_from_action(
             x_distance,
             x_direction,
             y_distance,
+            y_direction,
         ),
         Some(PlayerAction::Key(
             key @ Key {

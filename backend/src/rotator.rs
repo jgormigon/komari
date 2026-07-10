@@ -736,6 +736,7 @@ impl DefaultRotator {
                 wait_after_ticks_random_range,
                 position,
                 is_pathing,
+                is_monster_park: false,
             }),
         );
     }
@@ -912,6 +913,7 @@ impl DefaultRotator {
                     wait_after_ticks_random_range,
                     position,
                     is_pathing: false,
+                    is_monster_park: true,
                 }),
             );
             return;
