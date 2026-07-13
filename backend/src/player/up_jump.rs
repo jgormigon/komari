@@ -1,3 +1,5 @@
+use log::debug;
+
 use super::{
     Key, Player, PlayerContext,
     actions::update_from_ping_pong_action,
@@ -18,6 +20,14 @@ use crate::{
 
 /// Number of ticks to wait before spamming jump key.
 const SPAM_DELAY: u32 = 7;
+
+/// Number of ticks to wait before sending [`UpJumpingKind::UpArrow`]/[`UpJumpingKind::JumpKey`]'s
+/// follow-up key press.
+///
+/// Must stay below the ~4-6 ticks a plain jump's own rising velocity takes to cross
+/// [`UP_JUMPED_Y_VELOCITY_THRESHOLD`] on its own (observed from logs), otherwise the follow-up
+/// press loses the race against that false-positive completion check and never gets sent.
+const SECOND_PRESS_DELAY: u32 = 2;
 
 /// Number of ticks to wait before spamming jump key for lesser travel distance.
 const SOFT_SPAM_DELAY: u32 = 12;
@@ -75,6 +85,16 @@ pub struct UpJumping {
     spam_delay: u32,
     /// Whether auto-mobbing should wait for up jump completion in non-intermediate destination.
     auto_mob_wait_completion: bool,
+    /// Whether [`UpJumpingKind::UpArrow`]/[`UpJumpingKind::JumpKey`]'s follow-up key press has
+    /// been sent.
+    ///
+    /// A plain jump's own rising velocity crosses [`UP_JUMPED_Y_VELOCITY_THRESHOLD`] on its own
+    /// within a handful of ticks, well before [`Self::spam_delay`] - so gating the follow-up
+    /// press on that same velocity check meant it almost never actually got sent, and the up
+    /// jump combo silently degraded into a plain jump. This flag lets the follow-up press be
+    /// sent on its own short timer regardless of velocity, and reserves the velocity check for
+    /// deciding completion only after that press has gone out.
+    second_press_sent: bool,
 }
 
 impl UpJumping {
@@ -100,6 +120,7 @@ impl UpJumping {
             kind,
             spam_delay,
             auto_mob_wait_completion,
+            second_press_sent: false,
         }
     }
 
@@ -252,7 +273,7 @@ fn update_from_action(
             }
 
             let (x_distance, x_direction) = moving.x_distance_direction_from(false, cur_pos);
-            let (y_distance, _) = moving.y_distance_direction_from(false, cur_pos);
+            let (y_distance, y_direction) = moving.y_distance_direction_from(false, cur_pos);
             update_from_auto_mob_action(
                 resources,
                 player,
@@ -261,6 +282,7 @@ fn update_from_action(
                 x_distance,
                 x_direction,
                 y_distance,
+                y_direction,
             )
         }
 
@@ -331,19 +353,50 @@ fn update_up_jump(
             );
         }
         UpJumpingKind::UpArrow | UpJumpingKind::JumpKey => {
-            if context.velocity.1 <= UP_JUMPED_Y_VELOCITY_THRESHOLD {
-                // Spam jump/up arrow key until the player y changes
-                // above a threshold as sending jump key twice
-                // doesn't work.
-                if moving.timeout.total >= up_jumping.spam_delay {
+            // The follow-up press is sent on its own short timer, independent of velocity - a
+            // plain jump's own rising velocity crosses UP_JUMPED_Y_VELOCITY_THRESHOLD on its own
+            // within a handful of ticks, so gating this on velocity meant the follow-up press
+            // almost never actually went out before the check below concluded "already jumped".
+            if !up_jumping.second_press_sent {
+                if moving.timeout.total >= SECOND_PRESS_DELAY {
+                    debug!(
+                        target: "backend/player",
+                        "up jump sending follow-up key at timeout {}, velocity.1 {}",
+                        moving.timeout.total, context.velocity.1
+                    );
                     if matches!(up_jumping.kind, UpJumpingKind::UpArrow) {
                         resources.input.send_key(KeyKind::Up);
                     } else {
                         resources.input.send_key(jump_key);
                     }
+                    up_jumping.second_press_sent = true;
                 }
-            } else {
+                // Don't also fall through to the completion/fallback-spam check below on the
+                // same tick - `context.velocity` reflects the position from before this tick's
+                // press, so it can't yet show the effect of a press just sent this tick.
+                return;
+            }
+
+            if context.velocity.1 > UP_JUMPED_Y_VELOCITY_THRESHOLD {
+                debug!(
+                    target: "backend/player",
+                    "up jump completed at timeout {} (spam_delay {}), velocity.1 {}",
+                    moving.timeout.total, up_jumping.spam_delay, context.velocity.1
+                );
                 moving.completed = true;
+            } else if moving.timeout.total >= up_jumping.spam_delay {
+                // Fallback: the follow-up press above didn't register as a boost in time, keep
+                // spamming as before.
+                debug!(
+                    target: "backend/player",
+                    "up jump spamming key at timeout {} (spam_delay {}), velocity.1 {}",
+                    moving.timeout.total, up_jumping.spam_delay, context.velocity.1
+                );
+                if matches!(up_jumping.kind, UpJumpingKind::UpArrow) {
+                    resources.input.send_key(KeyKind::Up);
+                } else {
+                    resources.input.send_key(jump_key);
+                }
             }
         }
         UpJumpingKind::SpecificKey => {
@@ -472,6 +525,7 @@ mod tests {
             kind: UpJumpingKind::JumpKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         let mut keys = MockInput::new();
         keys.expect_send_key_down()
@@ -495,6 +549,7 @@ mod tests {
             kind: UpJumpingKind::UpArrow,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         let mut keys = MockInput::new();
         keys.expect_send_key()
@@ -515,6 +570,7 @@ mod tests {
             kind: UpJumpingKind::SpecificKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         player.context.config.up_jump_key = Some(KeyKind::C);
         let mut keys = MockInput::new();
@@ -539,6 +595,7 @@ mod tests {
             }),
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         player.context.config.teleport_key = Some(KeyKind::Shift);
         let mut keys = MockInput::new();
@@ -564,6 +621,7 @@ mod tests {
             kind: UpJumpingKind::JumpKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: true, // Follow-up press already sent, velocity now decides
         });
         player.context.velocity = (0.0, 2.0); // Y velocity above threshold
         let mut resources = Resources::new(None, None);
@@ -583,15 +641,16 @@ mod tests {
     }
 
     #[test]
-    fn update_up_jumping_state_updated_before_spam_delay_no_keys_sent() {
+    fn update_up_jumping_state_updated_before_second_press_delay_no_keys_sent() {
         let mut moving = Moving::new(Point::new(0, 0), Point::new(0, 20), true, None);
         moving.timeout.started = true;
-        moving.timeout.total = SPAM_DELAY - 2; // before threshold
+        moving.timeout.total = SECOND_PRESS_DELAY - 1; // before threshold
         let mut player = setup_player(UpJumping {
             moving,
             kind: UpJumpingKind::JumpKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         let mut keys = MockInput::new();
         keys.expect_send_key().never();
@@ -605,18 +664,42 @@ mod tests {
     }
 
     #[test]
-    fn update_up_jumping_state_updated_spam_jump_key_after_delay() {
+    fn update_up_jumping_state_updated_sends_follow_up_key_after_delay() {
         let mut moving = Moving::new(Point::new(0, 0), Point::new(0, 20), true, None);
         moving.timeout.started = true;
-        moving.timeout.total = SPAM_DELAY; // exactly at threshold
+        moving.timeout.total = SECOND_PRESS_DELAY; // exactly at threshold
         let mut player = setup_player(UpJumping {
             moving,
             kind: UpJumpingKind::JumpKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         let mut keys = MockInput::new();
-        // On spam, JumpKey kind sends Jump again
+        keys.expect_send_key()
+            .withf(|k| *k == KeyKind::Space)
+            .once();
+        let mut resources = Resources::new(Some(keys), None);
+
+        update_up_jumping_state(&mut resources, &mut player, Minimap::Detecting);
+
+        assert_matches!(player.state, Player::UpJumping(_));
+    }
+
+    #[test]
+    fn update_up_jumping_state_updated_spam_fallback_after_follow_up_press() {
+        let mut moving = Moving::new(Point::new(0, 0), Point::new(0, 20), true, None);
+        moving.timeout.started = true;
+        moving.timeout.total = SPAM_DELAY; // follow-up already sent, now past spam_delay too
+        let mut player = setup_player(UpJumping {
+            moving,
+            kind: UpJumpingKind::JumpKey,
+            spam_delay: SPAM_DELAY,
+            auto_mob_wait_completion: false,
+            second_press_sent: true,
+        });
+        player.context.velocity = (0.0, 0.0); // Y velocity still below threshold
+        let mut keys = MockInput::new();
         keys.expect_send_key()
             .withf(|k| *k == KeyKind::Space)
             .once();
@@ -637,6 +720,7 @@ mod tests {
             kind: UpJumpingKind::SpecificKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         player.context.config.up_jump_key = Some(KeyKind::C);
         let mut keys = MockInput::new();
@@ -661,6 +745,7 @@ mod tests {
             }),
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         player.context.config.jump_key = KeyKind::Space;
         player.context.config.teleport_key = Some(KeyKind::Shift);
@@ -685,6 +770,7 @@ mod tests {
             kind: UpJumpingKind::JumpKey,
             spam_delay: SPAM_DELAY,
             auto_mob_wait_completion: false,
+            second_press_sent: false,
         });
         let mut keys = MockInput::new();
         keys.expect_send_key_up()

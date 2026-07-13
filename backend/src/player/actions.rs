@@ -23,6 +23,15 @@ pub const AUTO_MOB_USE_KEY_X_THRESHOLD: i32 = 16;
 /// The minimum y distance required to transition to [`Player::UseKey`] in auto mob action.
 pub const AUTO_MOB_USE_KEY_Y_THRESHOLD: i32 = 8;
 
+/// The minimum y distance required to transition to [`Player::UseKey`] in [`AutoMob`] when
+/// [`AutoMob::is_monster_park`] and the mob is below the player.
+///
+/// Unlike [`AUTO_MOB_USE_KEY_Y_THRESHOLD`], which most attacks can comfortably reach when the mob
+/// is above, several skills only reach a few pixels below the player - so an 8px downward gap can
+/// still be out of range. Scoped to Monster Park only; regular auto mobbing keeps the symmetric
+/// [`AUTO_MOB_USE_KEY_Y_THRESHOLD`] for both directions since it already works well there.
+pub const MONSTER_PARK_USE_KEY_Y_BELOW_THRESHOLD: i32 = 3;
+
 /// Represents the fixed key action.
 ///
 /// Converted from [`ActionKey`] without fields used by [`Rotator`]
@@ -146,6 +155,10 @@ pub struct AutoMob {
     pub wait_after_ticks_random_range: u32,
     pub position: Position,
     pub is_pathing: bool,
+    /// Whether this action was issued by Monster Park's rotation instead of regular auto mobbing.
+    ///
+    /// See [`MONSTER_PARK_USE_KEY_Y_BELOW_THRESHOLD`].
+    pub is_monster_park: bool,
 }
 
 impl fmt::Display for AutoMob {
@@ -338,9 +351,14 @@ pub(super) fn update_from_auto_mob_action(
     x_distance: i32,
     x_direction: i32,
     y_distance: i32,
+    y_direction: i32,
 ) {
-    let should_terminate =
-        x_distance <= AUTO_MOB_USE_KEY_X_THRESHOLD && y_distance <= AUTO_MOB_USE_KEY_Y_THRESHOLD;
+    let y_threshold = if mob.is_monster_park && y_direction < 0 {
+        MONSTER_PARK_USE_KEY_Y_BELOW_THRESHOLD
+    } else {
+        AUTO_MOB_USE_KEY_Y_THRESHOLD
+    };
+    let should_terminate = x_distance <= AUTO_MOB_USE_KEY_X_THRESHOLD && y_distance <= y_threshold;
     if should_terminate && player.context.stalling_buffered.stalling() {
         player.context.clear_action_completed();
         player.state = Player::Idle;

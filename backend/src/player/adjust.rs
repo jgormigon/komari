@@ -176,7 +176,7 @@ fn update_from_action(
     let cur_pos = moving.pos;
     let context = &player.context;
     let (x_distance, x_direction) = moving.x_distance_direction_from(false, cur_pos);
-    let (y_distance, _) = moving.y_distance_direction_from(false, cur_pos);
+    let (y_distance, y_direction) = moving.y_distance_direction_from(false, cur_pos);
 
     match next_action(context) {
         Some(PlayerAction::Key(
@@ -220,6 +220,7 @@ fn update_from_action(
             x_distance,
             x_direction,
             y_distance,
+            y_direction,
         ),
         None
         | Some(
