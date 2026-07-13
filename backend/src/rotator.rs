@@ -253,8 +253,8 @@ pub struct DefaultRotator {
     /// killed by another hit or a party member) is never noticed and the player keeps trying to
     /// reach/attack a position with nothing there until the movement's own repeated-state abort
     /// eventually fires, which can take a while and does not clear the action anyway. Comparing
-    /// fresh (but throttled, see [`Self::monster_park_target_last_check_tick`]) detections against
-    /// this lets the action be abandoned as soon as the mob is confirmed gone. Cleared alongside
+    /// fresh (see [`Self::monster_park_enemies`]) detections against this lets the action be
+    /// abandoned as soon as the mob is confirmed gone. Cleared alongside
     /// [`Self::monster_park_no_enemy_count`].
     monster_park_target: Option<Point>,
     /// Tracks the number of consecutive checks the enemy at [`Self::monster_park_target`] was not
@@ -263,15 +263,25 @@ pub struct DefaultRotator {
     /// Debounced for the same reason as [`Self::monster_park_no_enemy_count`] - a single check's
     /// miss can be transient capture noise or dot overlap rather than the mob actually being dead.
     monster_park_target_missing_count: u32,
-    /// The [`Resources::tick`] the enemy at [`Self::monster_park_target`] was last re-checked.
+    /// Background task continuously re-scanning the minimap for Monster Park enemy dots.
     ///
-    /// The minimap enemy detection is a synchronous, non-trivial-cost detector call - running it
-    /// on every single tick while a movement (e.g. an up jump combo that needs its second key
-    /// press to land within a tight window) is in progress stretches out that tick's wall-clock
-    /// time enough to blow through the timing the movement depends on. Throttling this re-check
-    /// keeps the staleness fix from this same field's sibling docs without costing movement
-    /// precision.
-    monster_park_target_last_check_tick: Option<u64>,
+    /// The detection itself is a synchronous, non-trivial-cost call - running it inline on the
+    /// tick thread (even throttled) stretches out that tick's wall-clock time enough to interfere
+    /// with movement that depends on tight key-press timing (e.g. an up jump combo needing its
+    /// second key press to land within a short window). Running it via [`update_detection_task`]
+    /// moves that cost onto a background thread entirely: the tick loop only ever polls a channel
+    /// for whatever the latest completed scan found (essentially free), and a new scan is kicked
+    /// off again immediately once the previous one lands (`repeat_delay_millis: 0` - mirrors
+    /// [`Self::auto_mob_task`]'s use of the same pattern), so [`Self::monster_park_enemies`] stays
+    /// as fresh as the detector can make it without ever stalling a tick.
+    monster_park_enemies_task: Option<Task<Result<Vec<Rect>>>>,
+    /// Enemy dot positions from the most recently completed [`Self::monster_park_enemies_task`]
+    /// scan, already converted to the bottom-left, center-of-dot coordinate convention used
+    /// throughout [`DefaultRotator::rotate_monster_park`].
+    ///
+    /// Left unchanged while a scan is still in flight or fails, so a single slow/failed scan
+    /// doesn't blank out an otherwise-valid cache.
+    monster_park_enemies: Vec<Point>,
     /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park_entry`] has
     /// pressed Up while standing at the entry gate without the dungeon-select dialog appearing.
     ///
@@ -749,6 +759,33 @@ impl DefaultRotator {
         key: MobbingKey,
         _bound: Bound,
     ) {
+        let Minimap::Idle(idle) = minimap_state else {
+            return;
+        };
+
+        // Enemy dots are re-scanned continuously in the background (see
+        // `monster_park_enemies_task`'s docs) - both the stale-target re-validation below and the
+        // fresh-target pick further down read from this same always-refreshing cache instead of
+        // each making their own synchronous detector call.
+        match update_detection_task(
+            resources,
+            0,
+            &mut self.monster_park_enemies_task,
+            move |detector| Ok(detector.detect_minimap_monster_park_enemies(idle.bbox)),
+        ) {
+            Update::Ok(rects) => {
+                self.monster_park_enemies = rects
+                    .into_iter()
+                    .map(|rect| {
+                        // Flip coordinate to bottom-left, same convention as portals
+                        let y = idle.bbox.height - rect.br().y;
+                        Point::new(rect.x + rect.width / 2, y + rect.height / 2)
+                    })
+                    .collect();
+            }
+            Update::Err(_) | Update::Pending => (),
+        }
+
         // First check if player has a normal action, if so, let it complete. But if it is
         // pursuing a specific enemy (`monster_park_target`), keep re-validating that the enemy
         // is still there - otherwise a mob that dies mid-navigation (e.g. killed by a party
@@ -759,48 +796,21 @@ impl DefaultRotator {
             let Some(target) = self.monster_park_target else {
                 return;
             };
-            let Minimap::Idle(idle) = minimap_state else {
-                return;
-            };
 
-            // Re-checking is a synchronous detector call, not free - running it every tick
-            // stretches out that tick's wall-clock time, which is enough to break movement that
-            // depends on tight key-press timing (e.g. an up jump combo needing its second press
-            // within a short window). Throttling to a few times a second still catches a dead mob
-            // quickly without costing movement precision.
-            const MONSTER_PARK_TARGET_CHECK_INTERVAL_TICKS: u64 = 15;
-            if self.monster_park_target_last_check_tick.is_some_and(|last| {
-                resources.tick.saturating_sub(last) < MONSTER_PARK_TARGET_CHECK_INTERVAL_TICKS
-            }) {
-                return;
-            }
-            self.monster_park_target_last_check_tick = Some(resources.tick);
-
-            // A single check's detection can miss an enemy that is actually still there
-            // (transient capture noise, dots overlapping), so this requires a consecutive repeat
-            // miss before concluding the targeted enemy is actually dead - mirrors
-            // `monster_park_no_enemy_count`'s reasoning below. Unlike that per-tick counter, this
-            // one only increments once per `MONSTER_PARK_TARGET_CHECK_INTERVAL_TICKS`, so 2 is
-            // already a real ~1s gap between misses - plenty to rule out a single flaky frame
-            // without adding another ~500ms on top before abandoning a genuinely dead target.
-            const MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT: u32 = 2;
+            // A single scan can miss an enemy that is actually still there (transient capture
+            // noise, dots overlapping), so this requires a consecutive repeat miss before
+            // concluding the targeted enemy is actually dead - mirrors
+            // `monster_park_no_enemy_count`'s reasoning below.
+            const MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT: u32 = 3;
             // Tolerance for matching a fresh detection back to `monster_park_target`, loose
             // enough to absorb detection jitter and the enemy dot's own size (6x6) without being
             // so loose it matches a different, nearby enemy.
             const MONSTER_PARK_TARGET_MATCH_THRESHOLD: i32 = 10;
 
-            let still_present = resources
-                .detector()
-                .detect_minimap_monster_park_enemies(idle.bbox)
-                .into_iter()
-                .map(|rect| {
-                    let y = idle.bbox.height - rect.br().y;
-                    Point::new(rect.x + rect.width / 2, y + rect.height / 2)
-                })
-                .any(|point| {
-                    (point.x - target.x).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
-                        && (point.y - target.y).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
-                });
+            let still_present = self.monster_park_enemies.iter().any(|point| {
+                (point.x - target.x).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
+                    && (point.y - target.y).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
+            });
             if still_present {
                 self.monster_park_target_missing_count = 0;
                 return;
@@ -808,8 +818,7 @@ impl DefaultRotator {
 
             self.monster_park_target_missing_count =
                 self.monster_park_target_missing_count.saturating_add(1);
-            if self.monster_park_target_missing_count < MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT
-            {
+            if self.monster_park_target_missing_count < MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT {
                 return;
             }
 
@@ -817,7 +826,6 @@ impl DefaultRotator {
             player_context.reset_normal_action();
             self.monster_park_target = None;
             self.monster_park_target_missing_count = 0;
-            self.monster_park_target_last_check_tick = None;
             // Falls through to re-scan for a new target below instead of waiting for next tick.
         }
 
@@ -855,9 +863,6 @@ impl DefaultRotator {
             return;
         }
 
-        let Minimap::Idle(idle) = minimap_state else {
-            return;
-        };
         let Some(pos) = player_context.last_known_pos else {
             return;
         };
@@ -867,17 +872,11 @@ impl DefaultRotator {
         // camera-based mob detection, reachable-y correction, or ignore-xs/quadrant exploration
         // heuristics tied to a single map's geometry, none of which get reset across the several
         // maps a Monster Park run moves through.
-        let enemies = resources
-            .detector()
-            .detect_minimap_monster_park_enemies(idle.bbox);
-        debug!(target: "backend/rotator", "Monster Park: detected {} enemy dot(s): {:?}", enemies.len(), enemies);
-        let nearest_enemy = enemies
-            .into_iter()
-            .map(|rect| {
-                // Flip coordinate to bottom-left, same convention as portals
-                let y = idle.bbox.height - rect.br().y;
-                Point::new(rect.x + rect.width / 2, y + rect.height / 2)
-            })
+        debug!(target: "backend/rotator", "Monster Park: {} enemy dot(s) in cache: {:?}", self.monster_park_enemies.len(), self.monster_park_enemies);
+        let nearest_enemy = self
+            .monster_park_enemies
+            .iter()
+            .copied()
             .min_by_key(|point| (point.x - pos.x).pow(2) + (point.y - pos.y).pow(2));
 
         if let Some(point) = nearest_enemy {
@@ -886,7 +885,6 @@ impl DefaultRotator {
             self.monster_park_portal_attempts = 0;
             self.monster_park_target = Some(point);
             self.monster_park_target_missing_count = 0;
-            self.monster_park_target_last_check_tick = None;
 
             let key_hold_ticks = (key.key_hold_millis / MS_PER_TICK) as u32;
             let wait_before_ticks = (key.wait_before_millis / MS_PER_TICK) as u32;
@@ -935,7 +933,6 @@ impl DefaultRotator {
         // normal action (moving to the portal) is never mistaken for still pursuing this enemy.
         self.monster_park_target = None;
         self.monster_park_target_missing_count = 0;
-        self.monster_park_target_last_check_tick = None;
 
         // No enemies left on the minimap, check for portals. Detected fresh every tick instead
         // of through `idle.portals()`, which is a cache designed to be sticky/debounced for a
@@ -1483,7 +1480,8 @@ impl Rotator for DefaultRotator {
         self.monster_park_portal_attempts = 0;
         self.monster_park_target = None;
         self.monster_park_target_missing_count = 0;
-        self.monster_park_target_last_check_tick = None;
+        self.monster_park_enemies_task = None;
+        self.monster_park_enemies.clear();
         self.monster_park_gate_attempts = 0;
     }
 
