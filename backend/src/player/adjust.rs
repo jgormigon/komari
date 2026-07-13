@@ -30,10 +30,23 @@ pub const ADJUSTING_MEDIUM_THRESHOLD: i32 = 3;
 
 const ADJUSTING_SHORT_TIMEOUT: u32 = MOVE_TIMEOUT + 3;
 
+/// Number of short-adjust tap cycles to attempt reaching exact (0px) alignment before giving up
+/// and completing anyway.
+///
+/// A single 80ms tap's effect on position isn't guaranteed to be finer than
+/// [`ADJUSTING_SHORT_THRESHOLD`] - if it consistently overshoots past the target by more than
+/// that, `x_distance` can oscillate around 0 without ever landing on it exactly, and since this
+/// path already exempts itself from the normal move timeout (see `adjusting_started` below), that
+/// oscillation had no bound and could continue indefinitely. Giving up after a bounded number of
+/// cycles hands control back to the caller (e.g. the rotator), which re-issues a fresh approach
+/// rather than retrying the same tap in place forever.
+const MAX_SHORT_ADJUST_ATTEMPTS: u32 = 8;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Adjusting {
     pub moving: Moving,
     adjust_timeout: Timeout,
+    short_adjust_attempts: u32,
 }
 
 impl Adjusting {
@@ -41,6 +54,7 @@ impl Adjusting {
         Self {
             moving,
             adjust_timeout: Timeout::default(),
+            short_adjust_attempts: 0,
         }
     }
 
@@ -61,7 +75,10 @@ impl Adjusting {
                     }
                     timeout
                 }
-                Lifecycle::Ended => Timeout::default(),
+                Lifecycle::Ended => {
+                    self.short_adjust_attempts = self.short_adjust_attempts.saturating_add(1);
+                    Timeout::default()
+                }
                 Lifecycle::Updated(timeout) => timeout,
             };
     }
@@ -152,7 +169,10 @@ pub fn update_adjusting_state(
             // Computes and sets initial next state first
             let next_moving = if !moving.completed {
                 moving
-            } else if moving.exact && x_distance >= ADJUSTING_SHORT_THRESHOLD {
+            } else if moving.exact
+                && x_distance >= ADJUSTING_SHORT_THRESHOLD
+                && adjusting.short_adjust_attempts < MAX_SHORT_ADJUST_ATTEMPTS
+            {
                 // Exact adjusting incomplete
                 moving.completed(false).timeout_current(0)
             } else {
@@ -416,7 +436,8 @@ mod tests {
                     timeout: Timeout { current: 3, .. },
                     ..
                 },
-                adjust_timeout: Timeout { current: 2, .. }
+                adjust_timeout: Timeout { current: 2, .. },
+                ..
             })
         );
     }
@@ -444,6 +465,39 @@ mod tests {
                     timeout: Timeout {
                         current: 0,
                         started: true,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn update_adjusting_state_updated_completed_exact_gives_up_after_max_attempts() {
+        let mut resources = Resources::new(None, None);
+        let pos = Point { x: 0, y: 0 };
+        let dest = Point { x: 1, y: 0 };
+        let mut player = mock_player_entity(pos);
+
+        let moving = Moving::new(pos, dest, true, None)
+            .completed(true)
+            .timeout_current(4)
+            .timeout_started(true);
+        let mut adjusting = Adjusting::new(moving);
+        adjusting.short_adjust_attempts = MAX_SHORT_ADJUST_ATTEMPTS;
+        player.state = Player::Adjusting(adjusting);
+
+        update_adjusting_state(&mut resources, &mut player, Minimap::Detecting);
+
+        assert_matches!(
+            player.state,
+            Player::Adjusting(Adjusting {
+                moving: Moving {
+                    completed: true,
+                    timeout: Timeout {
+                        current: MOVE_TIMEOUT,
                         ..
                     },
                     ..

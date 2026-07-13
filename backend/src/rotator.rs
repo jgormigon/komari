@@ -777,10 +777,13 @@ impl DefaultRotator {
             self.monster_park_target_last_check_tick = Some(resources.tick);
 
             // A single check's detection can miss an enemy that is actually still there
-            // (transient capture noise, dots overlapping), so this requires several consecutive
-            // misses before concluding the targeted enemy is actually dead - mirrors
-            // `monster_park_no_enemy_count`'s reasoning below.
-            const MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT: u32 = 3;
+            // (transient capture noise, dots overlapping), so this requires a consecutive repeat
+            // miss before concluding the targeted enemy is actually dead - mirrors
+            // `monster_park_no_enemy_count`'s reasoning below. Unlike that per-tick counter, this
+            // one only increments once per `MONSTER_PARK_TARGET_CHECK_INTERVAL_TICKS`, so 2 is
+            // already a real ~1s gap between misses - plenty to rule out a single flaky frame
+            // without adding another ~500ms on top before abandoning a genuinely dead target.
+            const MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT: u32 = 2;
             // Tolerance for matching a fresh detection back to `monster_park_target`, loose
             // enough to absorb detection jitter and the enemy dot's own size (6x6) without being
             // so loose it matches a different, nearby enemy.
@@ -993,6 +996,11 @@ impl DefaultRotator {
         // difference small enough to be treated as "same platform" when moving is also accepted
         // as "arrived" once there, instead of asking to move and then refusing to call it close
         // enough forever.
+        //
+        // X needs to be genuinely exact (not just "close enough") - the in-game portal trigger
+        // is narrow enough that a few pixels off is enough for Up to do nothing, unlike Y where
+        // being on the right platform is what matters. See `Adjusting::short_adjust_attempts`
+        // for how the movement side avoids looping forever chasing this precision.
         const PORTAL_ARRIVED_X_THRESHOLD: i32 = 1;
         const PORTAL_Y_THRESHOLD: i32 = 8;
         let is_at_portal = (pos.x - portal_center_x).abs() <= PORTAL_ARRIVED_X_THRESHOLD
