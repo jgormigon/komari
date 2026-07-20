@@ -160,12 +160,6 @@ pub trait Detector: Debug + Send + Sync {
     /// Used as the anchor to locate the rest of the dialog's elements.
     fn detect_monster_park_ticket_label(&self) -> Result<Rect>;
 
-    /// Detects the Monster Park dungeon-select dialog's free entry ticket count.
-    fn detect_monster_park_ticket_count(&self) -> Result<u32>;
-
-    /// Detects the Monster Park dungeon-select dialog's "free clear(s) remaining" text.
-    fn detect_monster_park_free_clear_text(&self) -> Result<Rect>;
-
     /// Detects the locked/unavailable dungeon tile icons in the Monster Park dungeon-select
     /// dialog.
     fn detect_monster_park_locked_dungeon_tiles(&self) -> Vec<Rect>;
@@ -412,14 +406,6 @@ impl Detector for DefaultDetector {
 
     fn detect_monster_park_ticket_label(&self) -> Result<Rect> {
         detect_monster_park_ticket_label(self.grayscale())
-    }
-
-    fn detect_monster_park_ticket_count(&self) -> Result<u32> {
-        detect_monster_park_ticket_count(self.bgr(), self.grayscale())
-    }
-
-    fn detect_monster_park_free_clear_text(&self) -> Result<Rect> {
-        detect_monster_park_free_clear_text(self.grayscale())
     }
 
     fn detect_monster_park_locked_dungeon_tiles(&self) -> Vec<Rect> {
@@ -978,41 +964,6 @@ fn detect_monster_park_ticket_label(grayscale: &impl ToInputArray) -> Result<Rec
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
         imgcodecs::imdecode(
             include_bytes!(env!("MONSTER_PARK_TICKET_LABEL_TEMPLATE")),
-            IMREAD_GRAYSCALE,
-        )
-        .unwrap()
-    });
-
-    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
-}
-
-fn detect_monster_park_ticket_count(
-    bgr: &impl MatTraitConst,
-    grayscale: &impl ToInputArray,
-) -> Result<u32> {
-    // The ticket count number sits on the same row as the label, offset to the right (measured
-    // empirically from the dialog layout).
-    const NUMBER_X_OFFSET: i32 = 400;
-    const NUMBER_WIDTH: i32 = 68;
-
-    let label = detect_monster_park_ticket_label(grayscale)?;
-    let number_bbox = Rect::new(
-        label.x + NUMBER_X_OFFSET,
-        label.y,
-        NUMBER_WIDTH,
-        label.height,
-    );
-
-    extract_texts(bgr, &[number_bbox])
-        .first()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .ok_or(anyhow!("cannot detect Monster Park ticket count"))
-}
-
-fn detect_monster_park_free_clear_text(grayscale: &impl ToInputArray) -> Result<Rect> {
-    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(
-            include_bytes!(env!("MONSTER_PARK_FREE_CLEAR_TEXT_TEMPLATE")),
             IMREAD_GRAYSCALE,
         )
         .unwrap()
