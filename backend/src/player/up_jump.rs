@@ -55,6 +55,12 @@ const UP_JUMP_AND_TELEPORT_THRESHOLD: i32 = 23;
 
 const SOFT_UP_JUMP_THRESHOLD: i32 = 16;
 
+// Upstream issue #159 / PR #161 ("Improve up jump"): the old logic used a single boolean heuristic
+// and could pick jump-then-teleport when a direct teleport sufficed, or worse, perform the
+// up-jump half of a "up jump + teleport" combo and never fire the follow-up teleport at all. This
+// three-state machine plus the threshold constants above exist so exactly one of "just teleport" /
+// "jump then teleport" / "up-jump then teleport" is chosen by distance, and an up-jump always
+// transitions back through `MageState::Teleporting` so the teleport actually gets sent.
 #[derive(Debug, Clone, Copy)]
 struct Mage {
     state: MageState,
@@ -173,6 +179,13 @@ pub fn update_up_jumping_state(
                 return;
             }
 
+            // Upstream issue #196: on some maps a rune/target can sit close enough to an exit
+            // portal that lining up the x-coordinate to up-jump/teleport would carry the player
+            // through the portal, producing an infinite align-teleport-through-portal-walk-back
+            // loop. Aborting to Idle when already inside a portal's bounds breaks that loop. This
+            // is a deliberate trade-off (favors not triggering the portal over always reaching a
+            // target in this spot) with no code-only fix identified upstream — don't remove it
+            // without a replacement, or the loop comes back.
             let is_inside_portal = match minimap_state {
                 Minimap::Idle(idle) => idle.is_position_inside_portal(moving.pos),
                 _ => false,
@@ -286,6 +299,8 @@ fn update_from_action(
             )
         }
 
+        // Upstream PR #56 ("Improve `UseWith` `Any` for fall and up jump"): same reasoning as the
+        // matching branch in fall.rs — without it, `Any`-with key actions never fire mid up-jump.
         Some(PlayerAction::Key(
             key @ Key {
                 with: ActionKeyWith::Any,
