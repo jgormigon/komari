@@ -195,6 +195,9 @@ fn update_from_action(
             )
         }
 
+        // Upstream PR #56 ("Improve `UseWith` `Any` for fall and up jump"): this action used to be
+        // ignored outright while falling, so an `Any`-with key action could never fire mid-fall and
+        // had to wait for the next `Player::Moving` cycle. Keep this branch instead of no-op'ing it.
         Some(PlayerAction::Key(
             key @ Key {
                 with: ActionKeyWith::Any,
