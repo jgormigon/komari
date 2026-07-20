@@ -99,6 +99,10 @@ fn update_pressing_up(resources: &mut Resources, entering: &mut EnteringMonsterP
             entering.state = State::PressingUp(timeout);
         }
         Lifecycle::Ended => {
+            // Whether a free entry is actually available (ticket count/free-clear-remaining OCR)
+            // is unreliable to check upfront - just attempt the dungeon selection and Enter click,
+            // and treat a still-open dialog afterwards as "no free entry" instead (see
+            // `update_confirming`).
             let Ok(ticket_label) = resources.detector().detect_monster_park_ticket_label() else {
                 debug!(
                     target: "backend/player",
@@ -107,23 +111,6 @@ fn update_pressing_up(resources: &mut Resources, entering: &mut EnteringMonsterP
                 entering.state = State::Done;
                 return;
             };
-
-            let has_free_entry = resources
-                .detector()
-                .detect_monster_park_ticket_count()
-                .is_ok_and(|count| count != 0)
-                || resources
-                    .detector()
-                    .detect_monster_park_free_clear_text()
-                    .is_ok();
-            if !has_free_entry {
-                debug!(
-                    target: "backend/player",
-                    "Entering Monster Park: no free entry available, stopping"
-                );
-                entering.state = State::Done;
-                return;
-            }
 
             entering.state = State::SelectingDungeon(Timeout::default(), ticket_label);
         }
@@ -176,7 +163,17 @@ fn update_confirming(resources: &mut Resources, entering: &mut EnteringMonsterPa
             resources.input.send_mouse(x, y, MouseKind::Click);
             entering.state = State::Confirming(timeout);
         }
-        Lifecycle::Ended => entering.state = State::Done,
+        Lifecycle::Ended => {
+            // The dungeon-select dialog stays open if entry didn't actually go through (e.g. no
+            // free entry left) - clicking Enter otherwise dismisses it.
+            if resources.detector().detect_monster_park_ticket_label().is_ok() {
+                debug!(
+                    target: "backend/player",
+                    "Entering Monster Park: dialog still open after clicking Enter, assuming no free entry available"
+                );
+            }
+            entering.state = State::Done;
+        }
         Lifecycle::Updated(timeout) => entering.state = State::Confirming(timeout),
     }
 }
@@ -215,13 +212,28 @@ fn last_active_dungeon_tile(locked_tiles: &[Rect], ticket_label: Rect) -> Point 
         .map(|tile| Point::new(tile.x + tile.width / 2, tile.y + tile.height / 2))
         .collect();
 
+    // Sorting alone can't tell which side a lone detected column is on - e.g. a single locked
+    // tile sitting in the right column would otherwise get mislabeled as `left_x`, making the
+    // "is left column also locked" check below trivially true and skipping an extra row. Use the
+    // known reference columns purely to classify sides, keeping the actually-detected x for
+    // whichever side was observed.
+    let ref_left_x = anchor.x + FALLBACK_TILE_COL_X_OFFSETS[0];
+    let ref_right_x = anchor.x + FALLBACK_TILE_COL_X_OFFSETS[1];
+
     let mut col_xs: Vec<i32> = centers.iter().map(|point| point.x).collect();
     col_xs.sort_unstable();
     col_xs.dedup_by(|a, b| (*a - *b).abs() < CLUSTER_TOLERANCE);
-    let left_x = col_xs[0];
-    let right_x = *col_xs
-        .get(1)
-        .unwrap_or(&(anchor.x + FALLBACK_TILE_COL_X_OFFSETS[1]));
+    let (left_x, right_x) = match col_xs.as_slice() {
+        [single] => {
+            if (single - ref_left_x).abs() <= (single - ref_right_x).abs() {
+                (*single, ref_right_x)
+            } else {
+                (ref_left_x, *single)
+            }
+        }
+        [first, second, ..] => (*first, *second),
+        [] => (ref_left_x, ref_right_x),
+    };
 
     let mut row_ys: Vec<i32> = centers.iter().map(|point| point.y).collect();
     row_ys.sort_unstable();

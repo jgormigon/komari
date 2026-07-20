@@ -30,9 +30,9 @@ use crate::{
         WaitAfterBuffered,
     },
     player::{
-        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Move, Panic,
-        PanicTo, PingPong, PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant,
-        UseBooster,
+        AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
+        GRAPPLING_THRESHOLD, Key, Move, Panic, PanicTo, PingPong, PingPongDirection, PlayerAction,
+        PlayerContext, PlayerEntity, Quadrant, UseBooster,
     },
     run::MS_PER_TICK,
     skill::{Skill, SkillKind},
@@ -225,15 +225,24 @@ pub struct DefaultRotator {
     /// before concluding the map is actually clear and it's time to head to the portal. Resets to
     /// 0 as soon as any enemy is detected again.
     monster_park_no_enemy_count: u32,
-    /// The last successfully detected portal Rect for [`DefaultRotator::rotate_monster_park`].
+    /// Background task continuously re-scanning the minimap for the Monster Park portal.
     ///
-    /// The portal is detected fresh every tick rather than through the sticky minimap cache (see
-    /// that function for why), but once the player is standing on/near it, their own minimap
-    /// marker can visually overlap and occlude the portal icon, making it briefly undetectable
-    /// right when it's needed most. Falling back to the last known position for a few ticks
-    /// tolerates that without reintroducing staleness across a real map change - it's cleared as
-    /// soon as any enemy is detected again, which reliably happens at the start of sweeping a new
-    /// map.
+    /// Portal position needs to be re-scanned every tick rather than through the sticky
+    /// `idle.portals()` cache (see [`DefaultRotator::rotate_monster_park`] for why), but that
+    /// detection is a synchronous, non-trivial-cost call - running it inline on the tick thread
+    /// stretches out that tick's wall-clock time, which is exactly what was found to break
+    /// [`Self::monster_park_enemies_task`]'s tight-timing movement (up jump combos) before it was
+    /// moved to a background task. The player approaching the portal relies on the same kind of
+    /// tight timing (short-adjust's fixed-duration key taps, see `Adjusting::update_adjusting`),
+    /// so this is scanned the same way for the same reason.
+    monster_park_portal_task: Option<Task<Result<Vec<Rect>>>>,
+    /// The last successfully detected portal Rect from [`Self::monster_park_portal_task`].
+    ///
+    /// Once the player is standing on/near it, their own minimap marker can visually overlap and
+    /// occlude the portal icon, making a scan briefly come up empty right when it's needed most.
+    /// Falling back to the last known position for a few ticks tolerates that without
+    /// reintroducing staleness across a real map change - it's cleared as soon as any enemy is
+    /// detected again, which reliably happens at the start of sweeping a new map.
     monster_park_last_portal: Option<Rect>,
     /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park`] has pressed
     /// Up while standing at the portal without the map actually changing.
@@ -263,6 +272,17 @@ pub struct DefaultRotator {
     /// Debounced for the same reason as [`Self::monster_park_no_enemy_count`] - a single check's
     /// miss can be transient capture noise or dot overlap rather than the mob actually being dead.
     monster_park_target_missing_count: u32,
+    /// A newly-spotted enemy dot not yet committed to as [`Self::monster_park_target`], along with
+    /// how many consecutive scans it's been seen in.
+    ///
+    /// [`Self::monster_park_enemies_task`] refreshes far more often than the old throttled
+    /// synchronous check did (as fast as the detector can go, not a few times a second), which
+    /// makes a single-scan false positive (transient capture noise, aliasing) much more likely to
+    /// be caught and immediately committed to before it disappears on the very next scan. Requires
+    /// the same dot to reappear across a couple of scans before actually committing to chase it -
+    /// mirrors [`Self::monster_park_target_missing_count`]'s reasoning but for acquiring a target
+    /// instead of giving one up.
+    monster_park_pending_target: Option<(Point, u32)>,
     /// Background task continuously re-scanning the minimap for Monster Park enemy dots.
     ///
     /// The detection itself is a synchronous, non-trivial-cost call - running it inline on the
@@ -763,6 +783,12 @@ impl DefaultRotator {
             return;
         };
 
+        // Tolerance for matching a fresh detection back to a previously seen enemy dot, loose
+        // enough to absorb detection jitter and the dot's own size (6x6) without being so loose it
+        // matches a different, nearby enemy. Shared by both the still-pursuing-target check below
+        // and the new-target acquisition debounce further down.
+        const MONSTER_PARK_TARGET_MATCH_THRESHOLD: i32 = 10;
+
         // Enemy dots are re-scanned continuously in the background (see
         // `monster_park_enemies_task`'s docs) - both the stale-target re-validation below and the
         // fresh-target pick further down read from this same always-refreshing cache instead of
@@ -802,10 +828,6 @@ impl DefaultRotator {
             // concluding the targeted enemy is actually dead - mirrors
             // `monster_park_no_enemy_count`'s reasoning below.
             const MONSTER_PARK_TARGET_MISSING_DEBOUNCE_COUNT: u32 = 3;
-            // Tolerance for matching a fresh detection back to `monster_park_target`, loose
-            // enough to absorb detection jitter and the enemy dot's own size (6x6) without being
-            // so loose it matches a different, nearby enemy.
-            const MONSTER_PARK_TARGET_MATCH_THRESHOLD: i32 = 10;
 
             let still_present = self.monster_park_enemies.iter().any(|point| {
                 (point.x - target.x).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
@@ -881,6 +903,27 @@ impl DefaultRotator {
 
         if let Some(point) = nearest_enemy {
             self.monster_park_no_enemy_count = 0;
+
+            // The background scan refreshes far more often than the old throttled synchronous
+            // check did (as fast as the detector can go, not a few times a second), which makes a
+            // single-scan false positive (transient capture noise, aliasing) much more likely to
+            // be caught and committed to before it disappears on the very next scan. Require the
+            // same dot to reappear across a couple of scans before actually chasing it.
+            const MONSTER_PARK_NEW_TARGET_DEBOUNCE_COUNT: u32 = 2;
+            let seen_count = match self.monster_park_pending_target {
+                Some((candidate, seen_count))
+                    if (candidate.x - point.x).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD
+                        && (candidate.y - point.y).abs() <= MONSTER_PARK_TARGET_MATCH_THRESHOLD =>
+                {
+                    seen_count + 1
+                }
+                _ => 1,
+            };
+            self.monster_park_pending_target = Some((point, seen_count));
+            if seen_count < MONSTER_PARK_NEW_TARGET_DEBOUNCE_COUNT {
+                return;
+            }
+
             self.monster_park_last_portal = None;
             self.monster_park_portal_attempts = 0;
             self.monster_park_target = Some(point);
@@ -920,6 +963,10 @@ impl DefaultRotator {
             return;
         }
 
+        // No candidate to debounce against anymore - the enemy pursued next, whenever one shows
+        // up, starts its own fresh count.
+        self.monster_park_pending_target = None;
+
         // A single tick's detection can miss enemies that are actually still on the minimap
         // (transient capture noise, dots overlapping each other), so require several consecutive
         // empty detections before concluding the map is genuinely clear and it's time to look
@@ -934,32 +981,40 @@ impl DefaultRotator {
         self.monster_park_target = None;
         self.monster_park_target_missing_count = 0;
 
-        // No enemies left on the minimap, check for portals. Detected fresh every tick instead
-        // of through `idle.portals()`, which is a cache designed to be sticky/debounced for a
-        // single stable map (it only drops a portal after several consecutive misses). On a
-        // Monster Park map transition that cache can keep reporting the previous map's
-        // now-irrelevant portal position - or never clear it at all, if consecutive stages share
-        // similar enough minimap chrome that the anchor-mismatch check that would normally
-        // invalidate it doesn't trip.
-        let detected_portal = resources
-            .detector()
-            .detect_minimap_portals(idle.bbox)
-            .into_iter()
-            .map(|rect| {
-                // Flip coordinate to bottom-left, same convention as enemies
-                let y = idle.bbox.height - rect.br().y;
-                Rect::new(rect.x, y, rect.width, rect.height)
-            })
-            .next();
-        if detected_portal.is_some() {
-            self.monster_park_last_portal = detected_portal;
+        // No enemies left on the minimap, check for portals. Scanned continuously in the
+        // background (see `monster_park_portal_task`'s docs) instead of through `idle.portals()`,
+        // which is a cache designed to be sticky/debounced for a single stable map (it only drops
+        // a portal after several consecutive misses). On a Monster Park map transition that cache
+        // can keep reporting the previous map's now-irrelevant portal position - or never clear it
+        // at all, if consecutive stages share similar enough minimap chrome that the
+        // anchor-mismatch check that would normally invalidate it doesn't trip.
+        match update_detection_task(
+            resources,
+            0,
+            &mut self.monster_park_portal_task,
+            move |detector| Ok(detector.detect_minimap_portals(idle.bbox)),
+        ) {
+            Update::Ok(rects) => {
+                let detected_portal = rects
+                    .into_iter()
+                    .map(|rect| {
+                        // Flip coordinate to bottom-left, same convention as enemies
+                        let y = idle.bbox.height - rect.br().y;
+                        Rect::new(rect.x, y, rect.width, rect.height)
+                    })
+                    .next();
+                if detected_portal.is_some() {
+                    self.monster_park_last_portal = detected_portal;
+                }
+            }
+            Update::Err(_) | Update::Pending => (),
         }
         // Once the player is standing on/near the portal, their own minimap marker can visually
-        // overlap and occlude the portal icon, making this tick's fresh detection come up empty
-        // right when it's needed most to recognize arrival. Fall back to the last position that
-        // was actually detected instead of immediately declaring the map complete (see the field
-        // doc comment for how this stays safe across a real map change).
-        let Some(portal) = detected_portal.or(self.monster_park_last_portal) else {
+        // overlap and occlude the portal icon, making a scan come up empty right when it's needed
+        // most to recognize arrival. Fall back to the last position that was actually detected
+        // instead of immediately declaring the map complete (see the field doc comment for how
+        // this stays safe across a real map change).
+        let Some(portal) = self.monster_park_last_portal else {
             // No portal found, Monster Park is complete for this map
             debug!(target: "backend/rotator", "Monster Park: No mobs and no portal found, map complete");
             return;
@@ -998,8 +1053,20 @@ impl DefaultRotator {
         // is narrow enough that a few pixels off is enough for Up to do nothing, unlike Y where
         // being on the right platform is what matters. See `Adjusting::short_adjust_attempts`
         // for how the movement side avoids looping forever chasing this precision.
+        //
+        // Wider than it looks: this isn't just "close enough to not bother re-targeting height."
+        // Player::Moving's own jump trigger kicks in for *any* y-gap of 4px or more (see
+        // `JUMPABLE_RANGE` in moving.rs), well inside what this offset/detection can drift by
+        // between ticks (transient minimap-tracking noise, a recalibration, or a portal skin with
+        // slightly different icon padding than `PORTAL_GROUND_Y_OFFSET` was measured against).
+        // A too-tight threshold here lets that drift slip past as "different platform," freezing
+        // a stale target height into a Move that then wastes several seconds jumping in place at
+        // a gap that was never really there before self-recovering. Comfortably clearing the
+        // largest gap seen in practice (and then some) keeps that from tripping in normal play,
+        // while staying far below any genuine platform-to-platform gap (e.g. `GRAPPLING_THRESHOLD`
+        // is 24).
         const PORTAL_ARRIVED_X_THRESHOLD: i32 = 1;
-        const PORTAL_Y_THRESHOLD: i32 = 8;
+        const PORTAL_Y_THRESHOLD: i32 = 14;
         let is_at_portal = (pos.x - portal_center_x).abs() <= PORTAL_ARRIVED_X_THRESHOLD
             && (pos.y - portal_center_y).abs() <= PORTAL_Y_THRESHOLD;
 
@@ -1055,11 +1122,19 @@ impl DefaultRotator {
             // it's far enough from the player's current height to plausibly be a real platform
             // change - otherwise just walk there horizontally at the player's current height,
             // per the reasoning above.
-            let target_y = if (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD {
-                pos.y
-            } else {
-                portal_center_y
-            };
+            //
+            // That shortcut only makes sense once the player is already horizontally near the
+            // portal - `pos.y` at this exact tick could otherwise be read while still mid-jump/
+            // mid-grapple on a completely different, distant platform that happens to sit within
+            // `PORTAL_Y_THRESHOLD` of the portal's height by coincidence. Freezing that transient
+            // reading as the target then has the player climb back to it once they actually reach
+            // the portal's platform and its real (different) height takes over, instead of just
+            // heading straight for the portal's real height from the start. Gate on the same
+            // horizontal distance Player::Moving itself uses to decide "close enough to not need
+            // a double jump" - past that, we're not plausibly on the portal's platform yet.
+            let same_platform = (portal_center_x - pos.x).abs() < DOUBLE_JUMP_THRESHOLD
+                && (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD;
+            let target_y = if same_platform { pos.y } else { portal_center_y };
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
@@ -1476,10 +1551,12 @@ impl Rotator for DefaultRotator {
         self.auto_mob_task = None;
         self.auto_mob_quadrant_consecutive_count = None;
         self.monster_park_no_enemy_count = 0;
+        self.monster_park_portal_task = None;
         self.monster_park_last_portal = None;
         self.monster_park_portal_attempts = 0;
         self.monster_park_target = None;
         self.monster_park_target_missing_count = 0;
+        self.monster_park_pending_target = None;
         self.monster_park_enemies_task = None;
         self.monster_park_enemies.clear();
         self.monster_park_gate_attempts = 0;

@@ -45,8 +45,6 @@ fn main() {
     let monster_park_enemy = resources_dir.join("monster_park_enemy_ideal_ratio.png");
     let monster_park_entry_map = resources_dir.join("entry_map_indicator.png");
     let monster_park_ticket_label = resources_dir.join("monster_park_ticket_label_ideal_ratio.png");
-    let monster_park_free_clear_text =
-        resources_dir.join("monster_park_free_clear_text_ideal_ratio.png");
     let monster_park_dungeon_locked =
         resources_dir.join("monster_park_dungeon_locked_ideal_ratio.png");
     let monster_park_enter_button = resources_dir.join("monster_park_enter_button_ideal_ratio.png");
@@ -274,10 +272,6 @@ fn main() {
     println!(
         "cargo:rustc-env=MONSTER_PARK_TICKET_LABEL_TEMPLATE={}",
         monster_park_ticket_label.to_str().unwrap()
-    );
-    println!(
-        "cargo:rustc-env=MONSTER_PARK_FREE_CLEAR_TEXT_TEMPLATE={}",
-        monster_park_free_clear_text.to_str().unwrap()
     );
     println!(
         "cargo:rustc-env=MONSTER_PARK_DUNGEON_LOCKED_TEMPLATE={}",
