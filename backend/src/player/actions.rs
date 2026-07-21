@@ -11,7 +11,7 @@ use crate::{
     minimap::Minimap,
     models::{
         Action, ActionKey, ActionKeyDirection, ActionKeyWith, ActionMove, FamiliarRarity, Position,
-        SwappableFamiliars, WaitAfterBuffered,
+        SwappableFamiliars, WaitAfterBuffered, WorldMapRegion,
     },
     player::PlayerEntity,
     run::MS_PER_TICK,
@@ -244,6 +244,18 @@ pub struct ExchangeBooster {
     pub all: bool,
 }
 
+/// The navigation target for [`PlayerAction::NavigateToHuntingGround`].
+///
+/// Mirrors [`crate::models::DailyQuestEntry`]'s navigation fields.
+#[derive(Clone, Debug)]
+pub struct NavigateToHuntingGround {
+    pub region: WorldMapRegion,
+    pub dropdown_path: Vec<String>,
+    pub location_label: String,
+    pub location_point: (i32, i32),
+    pub sub_location_label: Option<String>,
+}
+
 /// Represents an action the [`Rotator`] can use.
 #[derive(Clone, Debug, Display)]
 pub enum PlayerAction {
@@ -275,6 +287,8 @@ pub enum PlayerAction {
     ExchangeBooster(ExchangeBooster),
     /// Enters a Monster Park run from the entry lobby's gate.
     EnterMonsterPark,
+    /// Navigates to a daily quest hunting ground via the in-game world map.
+    NavigateToHuntingGround(NavigateToHuntingGround),
     /// Unstucking by pressing ESC.
     Unstuck,
 }

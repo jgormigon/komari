@@ -26,13 +26,14 @@ use crate::{
     minimap::Minimap,
     models::{
         Action, ActionCondition, ActionKey, ActionKeyDirection, ActionKeyWith, ActionMove,
-        EliteBossBehavior, ExchangeHexaBoosterCondition, Familiars, MobbingKey, Position,
-        WaitAfterBuffered,
+        DailyQuestEntry, EliteBossBehavior, ExchangeHexaBoosterCondition, Familiars, MobbingKey,
+        Position, WaitAfterBuffered,
     },
+    notification::NotificationKind,
     player::{
         AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
-        GRAPPLING_THRESHOLD, Key, Move, Panic, PanicTo, PingPong, PingPongDirection, PlayerAction,
-        PlayerContext, PlayerEntity, Quadrant, UseBooster,
+        GRAPPLING_THRESHOLD, Key, Move, NavigateToHuntingGround, Panic, PanicTo, PingPong,
+        PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant, UseBooster,
     },
     run::MS_PER_TICK,
     skill::{Skill, SkillKind},
@@ -167,6 +168,12 @@ pub struct RotatorBuildArgs {
     pub enable_reset_normal_actions_on_erda: bool,
     pub enable_using_generic_booster: bool,
     pub enable_using_hexa_booster: bool,
+    /// Daily quest hunting-ground checklist to run before the map's normal [`RotatorMode`].
+    ///
+    /// See [`DefaultRotator::rotate_daily_quest`].
+    pub daily_quest_entries: Vec<DailyQuestEntry>,
+    /// Mobbing key shared by every daily quest entry.
+    pub daily_quest_mobbing_key: MobbingKey,
 }
 
 /// Handles rotating provided [`PlayerAction`]s.
@@ -309,6 +316,29 @@ pub struct DefaultRotator {
     /// [`MONSTER_PARK_GATE_ATTEMPT_LIMIT`], stop pressing Up and re-verify the player's position
     /// instead of retrying forever.
     monster_park_gate_attempts: u32,
+
+    /// Configured daily quest entries for [`Self::rotate_daily_quest`], from
+    /// [`RotatorBuildArgs::daily_quest_entries`].
+    ///
+    /// Only assigned in [`Self::build_actions`] - unlike the other `daily_quest_*` fields below,
+    /// this and [`Self::daily_quest_index`] represent actual checklist progress and must survive
+    /// a pause/resume (see [`Self::reset_queue`]), not just in-flight per-tick tracking.
+    daily_quest_entries: Vec<DailyQuestEntry>,
+    /// Mobbing key shared by every daily quest entry, from
+    /// [`RotatorBuildArgs::daily_quest_mobbing_key`].
+    daily_quest_mobbing_key: MobbingKey,
+    /// Index into [`Self::daily_quest_entries`] of the currently active entry.
+    ///
+    /// Once this reaches `daily_quest_entries.len()`, all configured dailies for this run have
+    /// been completed and [`Self::rotate_action`] falls through to the map's normal
+    /// [`RotatorMode`] instead of calling [`Self::rotate_daily_quest`].
+    daily_quest_index: usize,
+    /// Whether [`PlayerAction::NavigateToHuntingGround`] has already been issued for the entry at
+    /// [`Self::daily_quest_index`].
+    ///
+    /// Reset on [`Self::reset_queue`] (e.g. on pause) since a pause also aborts any in-flight
+    /// navigation - unlike [`Self::daily_quest_index`], this is transient per-attempt tracking.
+    daily_quest_navigating: bool,
 
     priority_actions: OrderedHashMap<u32, PriorityAction>,
     /// The currently executing [`RotatorAction::Linked`] action
@@ -650,6 +680,115 @@ impl DefaultRotator {
                 self.rotate_queuing_linked_action(&mut player.context, true);
             }
         }
+    }
+
+    /// Runs the daily quest checklist at [`Self::daily_quest_index`], if any is still pending.
+    ///
+    /// For the active entry, this navigates to its hunting ground (via
+    /// [`PlayerAction::NavigateToHuntingGround`]), then delegates to
+    /// [`Self::rotate_auto_mobbing`] using the entry's own [`DailyQuestEntry::bound`] and
+    /// [`DailyQuestEntry::mobbing_key`] - the mobbing behavior itself is identical to regular
+    /// auto-mobbing, only which map and area differ. Advances to the next entry once
+    /// [`Detector::detect_daily_quest_progress_popup`] reports the kill quota reached.
+    ///
+    /// Called from [`Self::rotate_action`] before the map's normal [`RotatorMode`] dispatch -
+    /// once every configured entry is completed, subsequent calls fall through to that normal
+    /// dispatch instead, so the bot then farms the current map as configured.
+    fn rotate_daily_quest(
+        &mut self,
+        resources: &mut Resources,
+        player_context: &mut PlayerContext,
+        minimap_state: Minimap,
+    ) {
+        let Some(entry) = self
+            .daily_quest_entries
+            .get(self.daily_quest_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        if !self.daily_quest_navigating {
+            if player_context.has_normal_action() || player_context.has_priority_action() {
+                return;
+            }
+
+            let navigation = entry.id.navigation();
+            debug!(
+                target: "backend/rotator",
+                "Daily Quest: navigating to {}", navigation.location_label
+            );
+            player_context.set_priority_action(
+                None,
+                PlayerAction::NavigateToHuntingGround(NavigateToHuntingGround {
+                    region: navigation.region,
+                    dropdown_path: navigation.dropdown_path,
+                    location_label: navigation.location_label,
+                    location_point: navigation.location_point,
+                    sub_location_label: navigation.sub_location_label,
+                }),
+            );
+            self.daily_quest_navigating = true;
+            return;
+        }
+
+        if player_context.has_priority_action() {
+            // Still navigating
+            return;
+        }
+
+        if player_context.take_daily_quest_navigate_failed() {
+            // Navigation didn't actually reach the hunting ground (e.g. world map key not
+            // configured, an expected UI element wasn't found) - `has_priority_action()` clears
+            // the same way on failure as it does on success, so without this check the code
+            // below would otherwise start auto-mobbing with this entry's bound wherever the
+            // player currently is instead of recognizing the attempt never got there. Skip this
+            // entry for the current run rather than mis-hunting or retrying forever.
+            info!(
+                target: "backend/rotator",
+                "Daily Quest: failed to navigate to {}, skipping for this run", entry.id
+            );
+            self.daily_quest_index += 1;
+            self.daily_quest_navigating = false;
+            self.auto_mob_task = None;
+            self.auto_mob_quadrant_consecutive_count = None;
+            return;
+        }
+
+        let progress = resources
+            .detector()
+            .detect_daily_quest_progress_popup()
+            .into_iter()
+            .find(|&(_, target)| target == entry.kill_target);
+        if let Some((current, target)) = progress
+            && current >= target
+        {
+            info!(
+                target: "backend/rotator",
+                "Daily Quest: completed {} ({current}/{target})", entry.id
+            );
+            resources
+                .character_updates
+                .mark_daily_quest_completed(entry.id);
+            self.daily_quest_index += 1;
+            self.daily_quest_navigating = false;
+            self.auto_mob_task = None;
+            self.auto_mob_quadrant_consecutive_count = None;
+            if self.daily_quest_index >= self.daily_quest_entries.len() {
+                resources
+                    .notification
+                    .schedule_notification(NotificationKind::DailyQuestCompleted);
+            }
+            return;
+        }
+
+        self.rotate_auto_mobbing(
+            resources,
+            player_context,
+            minimap_state,
+            self.daily_quest_mobbing_key,
+            entry.id.bound(),
+        );
     }
 
     fn rotate_auto_mobbing(
@@ -1134,7 +1273,11 @@ impl DefaultRotator {
             // a double jump" - past that, we're not plausibly on the portal's platform yet.
             let same_platform = (portal_center_x - pos.x).abs() < DOUBLE_JUMP_THRESHOLD
                 && (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD;
-            let target_y = if same_platform { pos.y } else { portal_center_y };
+            let target_y = if same_platform {
+                pos.y
+            } else {
+                portal_center_y
+            };
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
@@ -1392,6 +1535,8 @@ impl Rotator for DefaultRotator {
             enable_reset_normal_actions_on_erda,
             enable_using_generic_booster,
             enable_using_hexa_booster,
+            daily_quest_entries,
+            daily_quest_mobbing_key,
         } = args;
         self.reset_queue();
         self.normal_actions.clear();
@@ -1399,6 +1544,9 @@ impl Rotator for DefaultRotator {
         self.character_level = character_level;
         self.normal_actions_reset_on_erda = enable_reset_normal_actions_on_erda;
         self.priority_actions.clear();
+        self.daily_quest_entries = daily_quest_entries;
+        self.daily_quest_mobbing_key = daily_quest_mobbing_key;
+        self.daily_quest_index = 0;
 
         // Monster Park is a tight, timed sweep-then-portal loop across several maps - buffs,
         // boosters and Erda Shower off-cooldown actions are disruptive there (e.g. stopping to
@@ -1560,6 +1708,7 @@ impl Rotator for DefaultRotator {
         self.monster_park_enemies_task = None;
         self.monster_park_enemies.clear();
         self.monster_park_gate_attempts = 0;
+        self.daily_quest_navigating = false;
     }
 
     #[inline]
@@ -1579,6 +1728,11 @@ impl Rotator for DefaultRotator {
 
         self.rotate_priority_actions(resources, world);
         self.rotate_priority_actions_queue(&mut world.player);
+
+        if self.daily_quest_index < self.daily_quest_entries.len() {
+            self.rotate_daily_quest(resources, &mut world.player.context, world.minimap.state);
+            return;
+        }
 
         match self.normal_rotate_mode {
             RotatorMode::StartToEnd => self.rotate_start_to_end(&mut world.player.context),
@@ -2377,6 +2531,8 @@ mod tests {
             enable_reset_normal_actions_on_erda: false,
             enable_using_generic_booster: false,
             enable_using_hexa_booster: false,
+            daily_quest_entries: vec![],
+            daily_quest_mobbing_key: MobbingKey::default(),
         };
 
         rotator.build_actions(args);

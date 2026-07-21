@@ -42,6 +42,7 @@ pub enum NotificationKind {
     LieDetectorShapeAppear,
     LieDetectorViolettaAppear,
     RunTimerEnded,
+    DailyQuestCompleted,
 }
 
 impl NotificationKind {
@@ -67,6 +68,9 @@ impl NotificationKind {
                 settings.notifications.notify_on_lie_detector_appear
             }
             NotificationKind::RunTimerEnded => settings.notifications.notify_on_run_timer_end,
+            NotificationKind::DailyQuestCompleted => {
+                settings.notifications.notify_on_daily_quest_completed
+            }
         }
     }
 
@@ -114,6 +118,9 @@ impl NotificationKind {
             NotificationKind::RunTimerEnded => {
                 format!("{user_id}Bot run timer has ended.")
             }
+            NotificationKind::DailyQuestCompleted => {
+                format!("{user_id}Bot has completed all configured daily quests")
+            }
         }
     }
 
@@ -124,6 +131,7 @@ impl NotificationKind {
                 ScheduledFrame::new_deadline(4),
             ],
             NotificationKind::RunTimerEnded
+            | NotificationKind::DailyQuestCompleted
             | NotificationKind::EliteBossAppear
             | NotificationKind::PlayerIsDead
             | NotificationKind::PlayerGuildieAppear
@@ -141,6 +149,7 @@ impl NotificationKind {
         let secs = match self {
             NotificationKind::FailOrMapChange => 5,
             NotificationKind::RunTimerEnded
+            | NotificationKind::DailyQuestCompleted
             | NotificationKind::EliteBossAppear
             | NotificationKind::PlayerIsDead
             | NotificationKind::PlayerGuildieAppear

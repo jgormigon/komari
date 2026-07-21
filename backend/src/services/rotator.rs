@@ -77,6 +77,21 @@ impl RotatorService for DefaultRotatorService {
         self.args.enable_using_hexa_booster = character
             .map(|character| character.hexa_booster_key.enabled)
             .unwrap_or_default();
+        self.args.daily_quest_entries = character
+            .map(|character| {
+                let mut entries: Vec<_> = character
+                    .daily_quests
+                    .iter()
+                    .filter(|entry| entry.enabled && !entry.is_completed_today())
+                    .cloned()
+                    .collect();
+                entries.sort_by_key(|entry| entry.id);
+                entries
+            })
+            .unwrap_or_default();
+        self.args.daily_quest_mobbing_key = character
+            .map(|character| character.daily_quest_mobbing_key)
+            .unwrap_or_default();
     }
 
     fn update_from_settings(&mut self, settings: &Settings) {
@@ -254,8 +269,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionConfiguration, ActionConfigurationCondition, Bound, EliteBossBehavior,
-        FamiliarRarity, KeyBindingConfiguration, SwappableFamiliars,
+        ActionConfiguration, ActionConfigurationCondition, Bound, DailyQuestEntry, DailyQuestId,
+        EliteBossBehavior, FamiliarRarity, KeyBindingConfiguration, SwappableFamiliars,
     };
 
     #[test]
@@ -524,6 +539,48 @@ mod tests {
                     key: KeyBinding::F,
                     ..
                 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_daily_quest_entries_sorted_by_id_regardless_of_storage_order() {
+        let character = Character {
+            daily_quests: vec![
+                DailyQuestEntry {
+                    enabled: true,
+                    ..DailyQuestEntry::new(DailyQuestId::Tallahart)
+                },
+                DailyQuestEntry {
+                    enabled: true,
+                    ..DailyQuestEntry::new(DailyQuestId::Arcana)
+                },
+                DailyQuestEntry {
+                    enabled: false,
+                    ..DailyQuestEntry::new(DailyQuestId::VanishingJourney)
+                },
+                DailyQuestEntry {
+                    enabled: true,
+                    ..DailyQuestEntry::new(DailyQuestId::Cernium)
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut service = DefaultRotatorService::default();
+        service.update_from_characters(Some(&character));
+
+        assert_eq!(
+            service
+                .args
+                .daily_quest_entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![
+                DailyQuestId::Arcana,
+                DailyQuestId::Cernium,
+                DailyQuestId::Tallahart,
             ]
         );
     }

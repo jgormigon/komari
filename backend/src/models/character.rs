@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString};
 
 use super::{
-    ActionConfiguration, KeyBinding, KeyBindingConfiguration, deserialize_with_ok_or_default,
-    impl_identifiable,
+    ActionConfiguration, DailyQuestEntry, KeyBinding, KeyBindingConfiguration, MobbingKey,
+    deserialize_with_ok_or_default, impl_identifiable,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -28,6 +28,8 @@ pub struct Character {
     pub familiar_menu_key: Option<KeyBindingConfiguration>,
     pub to_town_key: Option<KeyBindingConfiguration>,
     pub change_channel_key: Option<KeyBindingConfiguration>,
+    #[serde(default)]
+    pub world_map_key: Option<KeyBindingConfiguration>,
     pub feed_pet_key: KeyBindingConfiguration,
     pub feed_pet_millis: u64,
     #[serde(default = "feed_pet_count_default", alias = "num_pets")]
@@ -94,6 +96,10 @@ pub struct Character {
     pub elite_boss_behavior: EliteBossBehavior,
     #[serde(default)]
     pub elite_boss_behavior_key: KeyBinding,
+    #[serde(default, deserialize_with = "deserialize_with_ok_or_default")]
+    pub daily_quests: Vec<DailyQuestEntry>,
+    #[serde(default)]
+    pub daily_quest_mobbing_key: MobbingKey,
 }
 
 impl_identifiable!(Character);
@@ -114,6 +120,7 @@ impl Default for Character {
             familiar_menu_key: None,
             to_town_key: None,
             change_channel_key: None,
+            world_map_key: None,
             feed_pet_key: KeyBindingConfiguration::default(),
             feed_pet_millis: 320000,
             feed_pet_count: feed_pet_count_default(),
@@ -157,6 +164,8 @@ impl Default for Character {
             actions: vec![],
             elite_boss_behavior_key: KeyBinding::default(),
             elite_boss_behavior: EliteBossBehavior::default(),
+            daily_quests: vec![],
+            daily_quest_mobbing_key: MobbingKey::default(),
         }
     }
 }

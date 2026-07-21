@@ -166,7 +166,11 @@ fn update_confirming(resources: &mut Resources, entering: &mut EnteringMonsterPa
         Lifecycle::Ended => {
             // The dungeon-select dialog stays open if entry didn't actually go through (e.g. no
             // free entry left) - clicking Enter otherwise dismisses it.
-            if resources.detector().detect_monster_park_ticket_label().is_ok() {
+            if resources
+                .detector()
+                .detect_monster_park_ticket_label()
+                .is_ok()
+            {
                 debug!(
                     target: "backend/player",
                     "Entering Monster Park: dialog still open after clicking Enter, assuming no free entry available"

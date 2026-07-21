@@ -3,6 +3,7 @@ use serde_json::Value;
 
 mod actions;
 mod character;
+mod daily;
 mod keys;
 mod localization;
 mod map;
@@ -11,6 +12,7 @@ mod settings;
 
 pub use actions::*;
 pub use character::*;
+pub use daily::*;
 pub use keys::*;
 pub use localization::*;
 pub use map::*;

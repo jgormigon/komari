@@ -322,6 +322,30 @@ pub trait Detector: Debug + Send + Sync {
 
     /// Detects violetta's number boxes.
     fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect>;
+
+    /// Detects the world map UI's `WORLD MAP` title.
+    ///
+    /// Used both to check whether the world map is currently open and as a fixed anchor to
+    /// locate the rest of its elements (region/area dropdowns, map content area) via offsets,
+    /// mirroring [`Self::detect_monster_park_ticket_label`].
+    fn detect_world_map_title(&self) -> Result<Rect>;
+
+    /// Detects a text label matching `text` (fuzzy, case-insensitive) within `roi`.
+    ///
+    /// Used both for world map dropdown options (region/area) and for a hunting ground's
+    /// clickable node label on the map itself.
+    fn detect_world_map_label(&self, roi: Rect, text: &str) -> Result<Rect>;
+
+    /// Detects daily quest kill-count progress popups (e.g. `"Cernium Region Mob 28 / 100"`)
+    /// currently on screen, returning each as `(current, target)`.
+    ///
+    /// Scans a generous screen-space region rather than a single fixed line, since multiple
+    /// popups can be stacked (one per active daily quest) and push each other up/down. Only
+    /// `target`s of `100`, `300` or `500` are returned - the only values a daily quest's kill
+    /// count can be - to reject unrelated OCR noise. Since multiple valid popups can be present
+    /// at once, callers should match the returned `target` against the specific
+    /// [`crate::models::DailyQuestEntry::kill_target`] they are tracking.
+    fn detect_daily_quest_progress_popup(&self) -> Vec<(u32, u32)>;
 }
 
 type MatFn = Box<dyn FnOnce() -> Mat + Send>;
@@ -618,6 +642,18 @@ impl Detector for DefaultDetector {
 
     fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect> {
         detect_violetta_numbers(&self.bgr().roi(region).unwrap())
+    }
+
+    fn detect_world_map_title(&self) -> Result<Rect> {
+        detect_world_map_title(self.grayscale())
+    }
+
+    fn detect_world_map_label(&self, roi: Rect, text: &str) -> Result<Rect> {
+        detect_world_map_label(self.bgr(), roi, text)
+    }
+
+    fn detect_daily_quest_progress_popup(&self) -> Vec<(u32, u32)> {
+        detect_daily_quest_progress_popup(self.bgr())
     }
 }
 
@@ -970,6 +1006,115 @@ fn detect_monster_park_ticket_label(grayscale: &impl ToInputArray) -> Result<Rec
     });
 
     detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
+fn detect_world_map_title(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("WORLD_MAP_TITLE_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
+fn detect_world_map_label(bgr: &impl MatTraitConst, roi: Rect, text: &str) -> Result<Rect> {
+    let bgr = bgr.roi(roi)?;
+
+    let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes(&bgr);
+    let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
+    let texts = extract_texts(&bgr, &bboxes);
+    let index = texts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let score = jaro_winkler(candidate.as_str(), text);
+            if score < 0.7 {
+                return None;
+            }
+            Some((index, score))
+        })
+        .max_by(|(_, first), (_, second)| first.partial_cmp(second).unwrap())
+        .ok_or(anyhow!("failed to find world map label `{text}`"))?
+        .0;
+
+    Ok(bboxes[index] + roi.tl())
+}
+
+/// Screen-space region of the daily quest kill-count banner(s) (e.g. `"Cernium Region Mob
+/// 28 / 100"`), generously wide/tall to fit longer hunting ground names and several banners
+/// stacked vertically (one per active daily quest, each pushing the others up/down) without
+/// relying on any anchor - unlike the world map, this banner has no border/frame to
+/// template-match against, but consistently renders near the same screen position regardless of
+/// player/camera position.
+fn detect_daily_quest_progress_popup(bgr: &impl MatTraitConst) -> Vec<(u32, u32)> {
+    /// The only values a daily quest's kill count can be - used to reject unrelated OCR noise
+    /// that happens to also contain a `/`.
+    const VALID_TARGETS: [u32; 3] = [100, 300, 500];
+    /// Maximum difference in `y` center between two text boxes for them to be considered part of
+    /// the same banner line.
+    const ROW_Y_TOLERANCE: i32 = 8;
+
+    let roi = Rect::new(500, 60, 550, 200);
+    let Ok(bgr) = bgr.roi(roi) else {
+        return Vec::new();
+    };
+
+    let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes(&bgr);
+    let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
+    let texts = extract_texts(&bgr, &bboxes);
+
+    let mut pairs = bboxes.into_iter().zip(texts).collect::<Vec<_>>();
+    pairs.sort_by_key(|(bbox, _)| bbox.y + bbox.height / 2);
+
+    let mut rows: Vec<Vec<(Rect, String)>> = Vec::new();
+    let mut prev_center_y: Option<i32> = None;
+    for pair in pairs {
+        let center_y = pair.0.y + pair.0.height / 2;
+        let starts_new_row = match prev_center_y {
+            Some(prev) => (center_y - prev).abs() > ROW_Y_TOLERANCE,
+            None => true,
+        };
+        if starts_new_row {
+            rows.push(Vec::new());
+        }
+        prev_center_y = Some(center_y);
+        rows.last_mut().expect("row was just pushed").push(pair);
+    }
+
+    rows.into_iter()
+        .filter_map(|mut row| {
+            row.sort_by_key(|(bbox, _)| bbox.x);
+            let joined = row
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            parse_daily_quest_progress(&joined)
+        })
+        .filter(|(_, target)| VALID_TARGETS.contains(target))
+        .collect()
+}
+
+/// Parses `"current / target"` (with possibly noisy surrounding text, e.g. a hunting ground name
+/// prefix) into `(current, target)`.
+fn parse_daily_quest_progress(text: &str) -> Option<(u32, u32)> {
+    let (before, after) = text.split_once('/')?;
+    let current: u32 = before
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    let target: u32 = after
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((current, target))
 }
 
 fn detect_monster_park_locked_dungeon_tiles(grayscale: &impl ToInputArray) -> Vec<Rect> {
@@ -3541,4 +3686,38 @@ fn build_session(model: &[u8]) -> Result<Session> {
     Ok(Session::builder()?
         .with_execution_providers([CUDAExecutionProvider::default().build()])?
         .commit_from_memory(model)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_daily_quest_progress;
+
+    #[test]
+    fn parse_daily_quest_progress_ok() {
+        assert_eq!(
+            parse_daily_quest_progress("Cernium Region Mob 28 / 100"),
+            Some((28, 100))
+        );
+        assert_eq!(
+            parse_daily_quest_progress("Labyrinth of Suffering Region Mob 300 / 300"),
+            Some((300, 300))
+        );
+        // No space around the slash
+        assert_eq!(
+            parse_daily_quest_progress("Cernium Region Mob 5/500"),
+            Some((5, 500))
+        );
+        // OCR noise around the digits
+        assert_eq!(
+            parse_daily_quest_progress("Cern1um Reg on Mob 51 / 100 !"),
+            Some((51, 100))
+        );
+    }
+
+    #[test]
+    fn parse_daily_quest_progress_err() {
+        assert_eq!(parse_daily_quest_progress(""), None);
+        assert_eq!(parse_daily_quest_progress("Cernium Region Mob"), None);
+        assert_eq!(parse_daily_quest_progress("no slash here 100"), None);
+    }
 }

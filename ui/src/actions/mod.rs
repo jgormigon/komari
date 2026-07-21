@@ -26,7 +26,7 @@ mod inner;
 mod input;
 mod list;
 mod platforms;
-mod popup;
+pub(crate) mod popup;
 mod rotation;
 
 const ITEM_TEXT_CLASS: &str =

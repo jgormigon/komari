@@ -19,8 +19,10 @@ use crate::services::debug::DebugService;
 use crate::{
     Localization, Settings,
     bridge::{Capture, DefaultInputReceiver, Input, InputMethod},
+    database::upsert_character,
     database_event_receiver,
     ecs::{Resources, World, WorldEvent},
+    models::DailyQuestEntry,
     rotator::Rotator,
     services::{
         capture::{CaptureService, DefaultCaptureService},
@@ -237,8 +239,39 @@ impl Services {
             self.event_bus.emit(&mut context, event);
         }
 
+        self.persist_daily_quest_completions(resources);
+
         #[cfg(debug_assertions)]
         self.debug.poll(resources);
         self.mediator.broadcast_state(resources, world);
+    }
+
+    /// Persists daily quest completions marked by the tick loop through
+    /// [`crate::ecs::CharacterUpdates`] (see its docs), if any.
+    fn persist_daily_quest_completions(&mut self, resources: &mut Resources) {
+        let completed = resources.character_updates.drain_completed_daily_quests();
+        if completed.is_empty() {
+            return;
+        }
+        let Some(mut character) = self.character.character().cloned() else {
+            return;
+        };
+
+        let today = DailyQuestEntry::today();
+        for id in completed {
+            if let Some(entry) = character
+                .daily_quests
+                .iter_mut()
+                .find(|entry| entry.id == id)
+            {
+                entry.last_completed_day = Some(today);
+            }
+        }
+        match upsert_character(&mut character) {
+            Ok(()) => self.character.update_character(Some(character)),
+            Err(err) => {
+                error!(target: "backend/services", "failed to persist daily quest completion {err}")
+            }
+        }
     }
 }

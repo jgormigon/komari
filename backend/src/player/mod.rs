@@ -30,6 +30,9 @@ use crate::{
         exchange_booster::{ExchangingBooster, update_exchanging_booster_state},
         fall::Falling,
         grapple::Grappling,
+        navigate_to_hunting_ground::{
+            NavigatingToHuntingGround, update_navigating_to_hunting_ground_state,
+        },
         solve_shape::{SolvingShape, update_solving_shape_state},
         solve_violetta::{SolvingVioletta, update_solving_violetta_state},
         unstuck::Unstucking,
@@ -49,6 +52,7 @@ mod grapple;
 mod idle;
 mod jump;
 mod moving;
+mod navigate_to_hunting_ground;
 mod panic;
 mod solve_rune;
 mod solve_shape;
@@ -120,6 +124,7 @@ pub enum Player {
     UsingBooster(UsingBooster),
     ExchangingBooster(ExchangingBooster),
     EnteringMonsterPark(EnteringMonsterPark),
+    NavigatingToHuntingGround(NavigatingToHuntingGround),
 }
 
 impl Player {
@@ -160,6 +165,7 @@ impl Player {
             | Player::UsingBooster(_)
             | Player::ExchangingBooster(_)
             | Player::EnteringMonsterPark(_)
+            | Player::NavigatingToHuntingGround(_)
             | Player::SolvingShape(_)
             | Player::SolvingVioletta(_)
             | Player::Stalling(_, _) => false,
@@ -274,6 +280,9 @@ fn update_non_positional_state(
         Player::UsingBooster(_) => update_using_booster_state(resources, player),
         Player::ExchangingBooster(_) => update_exchanging_booster_state(resources, player),
         Player::EnteringMonsterPark(_) => update_entering_monster_park_state(resources, player),
+        Player::NavigatingToHuntingGround(_) => {
+            update_navigating_to_hunting_ground_state(resources, player)
+        }
         Player::Detecting
         | Player::Idle
         | Player::Moving(_, _, _)
@@ -314,6 +323,7 @@ fn update_positional_state(
         | Player::UsingBooster(_)
         | Player::ExchangingBooster(_)
         | Player::EnteringMonsterPark(_)
+        | Player::NavigatingToHuntingGround(_)
         | Player::SolvingShape(_)
         | Player::SolvingVioletta(_)
         | Player::CashShopThenExit(_) => unreachable!(),

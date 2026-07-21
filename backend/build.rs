@@ -48,6 +48,7 @@ fn main() {
     let monster_park_dungeon_locked =
         resources_dir.join("monster_park_dungeon_locked_ideal_ratio.png");
     let monster_park_enter_button = resources_dir.join("monster_park_enter_button_ideal_ratio.png");
+    let world_map_title = resources_dir.join("world_map_title_ideal_ratio.png");
     let change_channel_menu = resources_dir.join("change_channel_menu_ideal_ratio.png");
     let admin = resources_dir.join("admin_ideal_ratio.png");
     let timer = resources_dir.join("timer_ideal_ratio.png");
@@ -280,6 +281,10 @@ fn main() {
     println!(
         "cargo:rustc-env=MONSTER_PARK_ENTER_BUTTON_TEMPLATE={}",
         monster_park_enter_button.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=WORLD_MAP_TITLE_TEMPLATE={}",
+        world_map_title.to_str().unwrap()
     );
     println!(
         "cargo:rustc-env=CHANGE_CHANNEL_MENU_TEMPLATE={}",
