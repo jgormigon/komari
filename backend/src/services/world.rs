@@ -48,6 +48,14 @@ impl EventHandler<WorldEvent> for WorldEventHandler {
                     return;
                 }
 
+                // Navigating to a daily quest's hunting ground intentionally changes maps too -
+                // opening the world map covers the minimap (triggering re-detection) and
+                // teleporting actually changes it. Without this, the watchdog below would send
+                // the player back to town mid-navigation on every single daily quest entry.
+                if context.rotator.is_navigating_daily_quest() {
+                    return;
+                }
+
                 let is_panicking = matches!(
                     context.world.player.state,
                     Player::Panicking(Panicking {

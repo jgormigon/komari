@@ -128,19 +128,20 @@ pub struct DailyQuestNavigation {
 
 impl DailyQuestId {
     /// The fixed world map navigation for this quest, captured empirically from reference
-    /// screenshots.
+    /// screenshots - each `location_point` is the exact pixel the cursor's fingertip was pointing
+    /// at (verified against a fresh screenshot per entry), as an offset from the `WORLD MAP` title
+    /// anchor's top-left corner.
     ///
     /// - Pick `region` from the top dropdown, then each entry of `dropdown_path` in order from
     ///   the next dropdown(s) it reveals (e.g. `["Tenebris", "Moonbridge"]` to drill from Arcane
     ///   River down to Tenebris's Moonbridge sub-map). Every dropdown's option list is
     ///   always-visible text, found via OCR.
-    /// - Once there, double-click the hunting ground's node. When `dropdown_path` is empty, the
-    ///   target is directly visible as a labelled node/banner on the region's own top-level
-    ///   overview, found via OCR against `location_label`. When `dropdown_path` is non-empty, the
-    ///   deeper map it leads to only shows individual room names as a hover tooltip rather than
-    ///   always-visible text - OCR can't find those, so `location_point` (a pixel offset from the
-    ///   world map's anchor) is used to click directly instead, and `location_label` is then just
-    ///   a human-readable name for display.
+    /// - Once there, double-click `location_point` directly. Matching the node's banner via OCR
+    ///   was tried instead, but scanning the whole map content area for text is slow enough to
+    ///   stall the tick loop for seconds at a time (observed multi-second "ticking running late"
+    ///   spikes) - a fixed, verified pixel is instant and, unlike the very first unverified
+    ///   attempt at hardcoding this, has actually been checked against a real screenshot per
+    ///   entry.
     /// - Some nodes (e.g. two hunting grounds sharing one icon) lead to an intermediate view
     ///   instead of an immediate teleport prompt - `sub_location_label`, if set, is
     ///   double-clicked there to reach the actual target.
@@ -168,112 +169,112 @@ impl DailyQuestId {
                 ArcaneRiver,
                 &["Vanishing Journey"],
                 "Extinction Zone : Spirit Zone",
-                (389, 301),
+                (525, 109),
                 None,
             ),
             DailyQuestId::ChuChuIsland => nav(
                 ArcaneRiver,
                 &["Chu Chu Island"],
                 "Slurpy Forest : Bitty-Bobble Forest 1",
-                (434, 421),
+                (423, 433),
                 None,
             ),
             DailyQuestId::Lachelein => nav(
                 ArcaneRiver,
                 &["Lachelein, the Dreaming City"],
                 "Lachelein Ballroom : Revelation Place 3",
-                (544, 418),
+                (545, 420),
                 None,
             ),
             DailyQuestId::Arcana => nav(
                 ArcaneRiver,
                 &["Arcana, The Mysterious Forest"],
                 "Arcana : Cavern Lower Path",
-                (461, 412),
+                (468, 422),
                 None,
             ),
             DailyQuestId::Morass => nav(
                 ArcaneRiver,
                 &["Morass, Swamp of Memory"],
                 "Morass : Shadowdance Hall 4",
-                (516, 198),
+                (416, 420),
                 None,
             ),
             DailyQuestId::Esfera => nav(
                 ArcaneRiver,
                 &["Esfera, The Origin Sea"],
                 "Esfera : Mirror-touched Sea 3",
-                (559, 452),
+                (490, 470),
                 None,
             ),
             DailyQuestId::Moonbridge => nav(
                 ArcaneRiver,
                 &["Tenebris", "Moonbridge"],
                 "Moonbridge : Void Current 3",
-                (579, 458),
+                (604, 455),
                 None,
             ),
             DailyQuestId::LabyrinthOfSuffering => nav(
                 ArcaneRiver,
                 &["Tenebris", "Labyrinth of Suffering"],
                 "Tenebris : Labyrinth of Suffering Deep Core 1",
-                (263, 463),
+                (262, 453),
                 None,
             ),
             DailyQuestId::Limina => nav(
                 ArcaneRiver,
                 &["Tenebris", "Limina"],
                 "Limina : End of the World 2-6",
-                (584, 441),
+                (593, 381),
                 None,
             ),
             DailyQuestId::Cernium => nav(
                 Grandis,
                 &["Western Grandis", "Cernium"],
                 "Cernium : Royal Library Section 1",
-                (511, 148),
+                (399, 151),
                 None,
             ),
             DailyQuestId::HotelArcus => nav(
                 Grandis,
                 &["Western Grandis", "Hotel Arcus"],
                 "Hotel Arcus : Nostalgic Drive-in Theater 4",
-                (494, 315),
+                (501, 320),
                 None,
             ),
             DailyQuestId::Odium => nav(
                 Grandis,
                 &["Western Grandis", "Odium"],
                 "Odium : Captured Alley 2",
-                (426, 281),
+                (426, 288),
                 None,
             ),
             DailyQuestId::ShangriLa => nav(
                 Grandis,
                 &["Western Grandis", "Shangri-La"],
                 "Shangri-La : Blooming Spring 2",
-                (321, 473),
+                (226, 475),
                 None,
             ),
             DailyQuestId::Arteria => nav(
                 Grandis,
                 &["Western Grandis", "Arteria"],
                 "Empress Road : Southern Outskirts",
-                (213, 455),
+                (271, 473),
                 None,
             ),
             DailyQuestId::Carcion => nav(
                 Grandis,
                 &["Western Grandis", "Carcion"],
                 "Carcion : Giant Coral Colony 3",
-                (198, 171),
+                (198, 176),
                 None,
             ),
             DailyQuestId::Tallahart => nav(
                 Grandis,
                 &["Western Grandis", "Tallahart"],
                 "Tallahart : Silent Ashlands 3",
-                (184, 461),
+                (192, 468),
                 None,
             ),
         }

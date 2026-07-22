@@ -81,7 +81,8 @@ pub fn DailiesScreen() -> Element {
                     }
                 }
                 Section { title: "Arcane River",
-                    div { class: "flex flex-col gap-2",
+                    div { class: "flex flex-col",
+                        DailyQuestListHeader {}
                         for id in DailyQuestId::iter()
                             .filter(|id| id.navigation().region == WorldMapRegion::ArcaneRiver)
                         {
@@ -107,7 +108,8 @@ pub fn DailiesScreen() -> Element {
                     }
                 }
                 Section { title: "Grandis",
-                    div { class: "flex flex-col gap-2",
+                    div { class: "flex flex-col",
+                        DailyQuestListHeader {}
                         for id in DailyQuestId::iter()
                             .filter(|id| id.navigation().region == WorldMapRegion::Grandis)
                         {
@@ -153,6 +155,19 @@ pub fn DailiesScreen() -> Element {
     }
 }
 
+const ROW_GRID_CLASS: &str = "grid grid-cols-[24px_1fr_90px] items-center gap-3";
+
+#[component]
+fn DailyQuestListHeader() -> Element {
+    rsx! {
+        div { class: "{ROW_GRID_CLASS} h-6 text-xxs text-tertiary-text",
+            div {}
+            div { "Quest" }
+            div { "Kill target" }
+        }
+    }
+}
+
 #[component]
 fn DailyQuestRow(
     id: DailyQuestId,
@@ -169,7 +184,7 @@ fn DailyQuestRow(
     };
 
     rsx! {
-        div { class: "grid grid-cols-[24px_1fr_90px] items-center gap-3 h-8",
+        div { class: "{ROW_GRID_CLASS} h-8 px-1 border-b border-secondary-border last:border-b-0 hover:bg-secondary-surface",
             Checkbox { checked: entry.enabled, disabled, on_checked: on_toggle }
             div { class: "text-xs {name_class} text-ellipsis overflow-hidden whitespace-nowrap",
                 "{id}"

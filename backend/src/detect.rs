@@ -330,6 +330,14 @@ pub trait Detector: Debug + Send + Sync {
     /// mirroring [`Self::detect_monster_park_ticket_label`].
     fn detect_world_map_title(&self) -> Result<Rect>;
 
+    /// Detects the "Click to open the World Map" button in the minimap's title bar.
+    ///
+    /// Used by [`crate::player::navigate_to_hunting_ground`] as a fallback for opening the world
+    /// map when [`crate::player::state::PlayerConfiguration::world_map_key`] is not configured or
+    /// pressing it didn't actually open the world map - unlike the key, this button always exists
+    /// regardless of user keybind configuration.
+    fn detect_minimap_world_map_button(&self) -> Result<Rect>;
+
     /// Detects a text label matching `text` (fuzzy, case-insensitive) within `roi`.
     ///
     /// Used both for world map dropdown options (region/area) and for a hunting ground's
@@ -339,13 +347,23 @@ pub trait Detector: Debug + Send + Sync {
     /// Detects daily quest kill-count progress popups (e.g. `"Cernium Region Mob 28 / 100"`)
     /// currently on screen, returning each as `(current, target)`.
     ///
-    /// Scans a generous screen-space region rather than a single fixed line, since multiple
-    /// popups can be stacked (one per active daily quest) and push each other up/down. Only
-    /// `target`s of `100`, `300` or `500` are returned - the only values a daily quest's kill
-    /// count can be - to reject unrelated OCR noise. Since multiple valid popups can be present
-    /// at once, callers should match the returned `target` against the specific
+    /// Cheaply gated on a template match of the constant `"Region Mob"` substring rather than
+    /// scanning a generous screen-space region with a full OCR pass every time - see the free
+    /// function of the same name for why. Only `target`s of `100`, `300` or `500` are returned -
+    /// the only values a daily quest's kill count can be - to reject unrelated OCR noise. Since
+    /// multiple valid popups can be present at once (one per active daily quest, stacked
+    /// vertically), callers should match the returned `target` against the specific
     /// [`crate::models::DailyQuestEntry::kill_target`] they are tracking.
     fn detect_daily_quest_progress_popup(&self) -> Vec<(u32, u32)>;
+
+    /// Detects the "Quest complete!" toast banner shown briefly at the bottom of the screen when
+    /// any quest (not necessarily a daily) finishes.
+    ///
+    /// Regular, non-daily quests raise the exact same banner, so callers must not treat a match
+    /// alone as a daily quest completing - combine with [`Self::detect_world_map_label`] against
+    /// `"[Daily Quest]"` on a region below the returned [`Rect`] (where the toast's second line,
+    /// naming the specific quest, renders) to confirm it actually is one.
+    fn detect_quest_complete_popup(&self) -> Result<Rect>;
 }
 
 type MatFn = Box<dyn FnOnce() -> Mat + Send>;
@@ -648,12 +666,20 @@ impl Detector for DefaultDetector {
         detect_world_map_title(self.grayscale())
     }
 
+    fn detect_minimap_world_map_button(&self) -> Result<Rect> {
+        detect_minimap_world_map_button(self.grayscale())
+    }
+
     fn detect_world_map_label(&self, roi: Rect, text: &str) -> Result<Rect> {
         detect_world_map_label(self.bgr(), roi, text)
     }
 
     fn detect_daily_quest_progress_popup(&self) -> Vec<(u32, u32)> {
-        detect_daily_quest_progress_popup(self.bgr())
+        detect_daily_quest_progress_popup(self.bgr(), self.grayscale())
+    }
+
+    fn detect_quest_complete_popup(&self) -> Result<Rect> {
+        detect_quest_complete_popup(self.grayscale())
     }
 }
 
@@ -1020,6 +1046,27 @@ fn detect_world_map_title(grayscale: &impl ToInputArray) -> Result<Rect> {
     detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
 }
 
+fn detect_minimap_world_map_button(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(
+            include_bytes!(env!("WORLD_MAP_OPEN_BUTTON_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
+fn detect_quest_complete_popup(grayscale: &impl ToInputArray) -> Result<Rect> {
+    static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("QUEST_COMPLETE_TEMPLATE")), IMREAD_GRAYSCALE)
+            .unwrap()
+    });
+
+    detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
+}
+
 fn detect_world_map_label(bgr: &impl MatTraitConst, roi: Rect, text: &str) -> Result<Rect> {
     let bgr = bgr.roi(roi)?;
 
@@ -1043,55 +1090,90 @@ fn detect_world_map_label(bgr: &impl MatTraitConst, roi: Rect, text: &str) -> Re
     Ok(bboxes[index] + roi.tl())
 }
 
-/// Screen-space region of the daily quest kill-count banner(s) (e.g. `"Cernium Region Mob
-/// 28 / 100"`), generously wide/tall to fit longer hunting ground names and several banners
-/// stacked vertically (one per active daily quest, each pushing the others up/down) without
-/// relying on any anchor - unlike the world map, this banner has no border/frame to
-/// template-match against, but consistently renders near the same screen position regardless of
-/// player/camera position.
-fn detect_daily_quest_progress_popup(bgr: &impl MatTraitConst) -> Vec<(u32, u32)> {
+/// Detects the daily quest kill-count banner(s) (e.g. `"Cernium Region Mob 28 / 100"`) currently
+/// on screen, returning each as `(current, target)`.
+///
+/// Unlike the previous implementation, this no longer runs a full-frame OCR pass every poll.
+/// `"Region Mob"` is a constant substring shared by every banner - only the hunting ground name
+/// and the kill count vary - so it's template-matched first (see [`REGION_MOB_LABEL_TEMPLATE`])
+/// as a cheap gate, up to [`VALID_TARGETS`]'s length times to catch several banners stacked
+/// vertically (one per active daily quest, each pushing the others up/down). The kill count is
+/// only OCR'd (recognition net only, no text-detection net) on a small region to the right of an
+/// actual match, instead of unconditionally paying for full text detection across a generous
+/// region on every poll regardless of whether anything is even on screen.
+///
+/// Threshold and template were tuned against real screenshots of the banner over a variety of
+/// backgrounds (see the `region_mob_ideal_ratio` template) - genuine matches scored at least
+/// ~0.52 there while unrelated frames topped out at ~0.31, so 0.45 leaves a wide margin either
+/// side despite the banner having no border/frame to anchor on like other UI templates do.
+fn detect_daily_quest_progress_popup(
+    bgr: &impl MatTraitConst,
+    grayscale: &impl ToInputArray,
+) -> Vec<(u32, u32)> {
     /// The only values a daily quest's kill count can be - used to reject unrelated OCR noise
     /// that happens to also contain a `/`.
     const VALID_TARGETS: [u32; 3] = [100, 300, 500];
-    /// Maximum difference in `y` center between two text boxes for them to be considered part of
-    /// the same banner line.
-    const ROW_Y_TOLERANCE: i32 = 8;
+    /// Up to one banner per currently trackable daily quest kill target.
+    const MAX_POPUPS: usize = VALID_TARGETS.len();
+    const LABEL_MATCH_THRESHOLD: f64 = 0.45;
+    /// Width of the region scanned to the right of a matched label for the "current / target"
+    /// digits - generous enough for 3-digit counts on both sides of the `/`.
+    const NUMBERS_ROI_WIDTH: i32 = 170;
+    /// Extra height, above and below a matched label's own height, of the region scanned for the
+    /// digits - the label and the digits after it don't necessarily share the exact same
+    /// baseline.
+    const NUMBERS_ROI_VERTICAL_PADDING: i32 = 8;
 
-    let roi = Rect::new(500, 60, 550, 200);
-    let Ok(bgr) = bgr.roi(roi) else {
+    static LABEL_TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
+        imgcodecs::imdecode(include_bytes!(env!("REGION_MOB_LABEL_TEMPLATE")), IMREAD_GRAYSCALE)
+            .unwrap()
+    });
+
+    let label_matches = detect_template_multiple(
+        grayscale,
+        &*LABEL_TEMPLATE,
+        no_array(),
+        Point::default(),
+        MAX_POPUPS,
+        LABEL_MATCH_THRESHOLD,
+    );
+    debug!(target: "backend/daily_quest", "progress popup label matches {label_matches:?}");
+
+    let Ok(bgr_bounds) = bgr.size().map(|size| Rect::new(0, 0, size.width, size.height)) else {
         return Vec::new();
     };
 
-    let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes(&bgr);
-    let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
-    let texts = extract_texts(&bgr, &bboxes);
+    label_matches
+        .into_iter()
+        .filter_map(|result| result.ok())
+        .filter_map(|(label_rect, _)| {
+            let roi = Rect::new(
+                label_rect.br().x,
+                label_rect.y - NUMBERS_ROI_VERTICAL_PADDING,
+                NUMBERS_ROI_WIDTH,
+                label_rect.height + NUMBERS_ROI_VERTICAL_PADDING * 2,
+            ) & bgr_bounds;
+            let numbers_bgr = bgr.roi(roi).ok()?;
 
-    let mut pairs = bboxes.into_iter().zip(texts).collect::<Vec<_>>();
-    pairs.sort_by_key(|(bbox, _)| bbox.y + bbox.height / 2);
+            // Tried bumping this ROI's magnification ratio above the `5.0` default (this crop is
+            // smaller than what that default was tuned against) to see if it would stop the
+            // separator glyph from fusing into an adjacent digit (e.g. `/300` read as `1300`).
+            // Tested against real screenshots: it didn't - it shifted which reads fuse rather
+            // than reducing fusion overall, breaking 3 previously-clean reads for every 1 it
+            // fixed. Left at the default since that measured strictly better.
+            let (mat_in, w_ratio, h_ratio) = preprocess_for_text_bboxes(&numbers_bgr);
+            let bboxes = extract_text_bboxes(&mat_in, w_ratio, h_ratio, 0, 0);
+            let texts = extract_texts(&numbers_bgr, &bboxes);
 
-    let mut rows: Vec<Vec<(Rect, String)>> = Vec::new();
-    let mut prev_center_y: Option<i32> = None;
-    for pair in pairs {
-        let center_y = pair.0.y + pair.0.height / 2;
-        let starts_new_row = match prev_center_y {
-            Some(prev) => (center_y - prev).abs() > ROW_Y_TOLERANCE,
-            None => true,
-        };
-        if starts_new_row {
-            rows.push(Vec::new());
-        }
-        prev_center_y = Some(center_y);
-        rows.last_mut().expect("row was just pushed").push(pair);
-    }
-
-    rows.into_iter()
-        .filter_map(|mut row| {
-            row.sort_by_key(|(bbox, _)| bbox.x);
-            let joined = row
+            let mut pairs = bboxes.iter().zip(texts.iter()).collect::<Vec<_>>();
+            pairs.sort_by_key(|(bbox, _)| bbox.x);
+            let joined = pairs
                 .into_iter()
-                .map(|(_, text)| text)
+                .map(|(_, text)| text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            debug!(target: "backend/daily_quest", "progress popup numbers roi {roi:?} raw ocr text {joined:?}");
+
             parse_daily_quest_progress(&joined)
         })
         .filter(|(_, target)| VALID_TARGETS.contains(target))
@@ -1101,11 +1183,27 @@ fn detect_daily_quest_progress_popup(bgr: &impl MatTraitConst) -> Vec<(u32, u32)
 /// Parses `"current / target"` (with possibly noisy surrounding text, e.g. a hunting ground name
 /// prefix) into `(current, target)`.
 fn parse_daily_quest_progress(text: &str) -> Option<(u32, u32)> {
-    let (before, after) = text.split_once('/')?;
+    // The recognition model frequently misreads the thin `/` glyph in this particular font as a
+    // standalone capital `I` - it's essentially just a vertical stroke to the recognizer, and
+    // real-world text corpora have far more `I`s than `/`s. Normalized (only as a whole word, so
+    // a genuine `I` elsewhere in OCR noise isn't corrupted into a bogus separator) before
+    // splitting so a clean misread doesn't sink an otherwise-good read.
+    let normalized = text
+        .split_whitespace()
+        .map(|word| if word == "I" { "/" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let (before, after) = normalized.split_once('/')?;
+    // The last digit run before the separator, skipping past any noise word that landed directly
+    // between it and the separator (e.g. `"25 the / 100"`, where `"the"` is itself OCR noise from
+    // the hunting ground name's decorative background bleeding through) - `target` below doesn't
+    // need this since it only ever looks at the leading digit run, which noise after it can't
+    // affect.
     let current: u32 = before
         .trim_end()
         .rsplit(|c: char| !c.is_ascii_digit())
-        .next()?
+        .find(|segment| !segment.is_empty())?
         .parse()
         .ok()?;
     let target: u32 = after
@@ -1114,6 +1212,15 @@ fn parse_daily_quest_progress(text: &str) -> Option<(u32, u32)> {
         .next()?
         .parse()
         .ok()?;
+
+    // A kill count can never exceed its own cap, so `current > target` can only be OCR
+    // corruption - typically the separator glyph fusing into an adjacent digit run (e.g. `/300`
+    // misread as `1300`) instead of landing as its own token. Better to report nothing than let a
+    // corrupted read fire a false completion.
+    if current > target {
+        return None;
+    }
+
     Some((current, target))
 }
 
@@ -3692,6 +3799,48 @@ fn build_session(model: &[u8]) -> Result<Session> {
 mod tests {
     use super::parse_daily_quest_progress;
 
+    struct StdoutLogger;
+
+    impl log::Log for StdoutLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            println!("[{} {}] {}", record.level(), record.target(), record.args());
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    #[ignore = "manual validation against local raw_resources screenshots, not a CI fixture"]
+    fn detect_daily_quest_progress_popup_against_dataset() {
+        use std::fs;
+
+        use opencv::imgcodecs::{self, IMREAD_COLOR, IMREAD_GRAYSCALE};
+
+        use super::detect_daily_quest_progress_popup;
+
+        static LOGGER: StdoutLogger = StdoutLogger;
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../raw_resources/kill_count_pop_up");
+        let mut entries = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+
+        for path in entries {
+            let bgr = imgcodecs::imread(path.to_str().unwrap(), IMREAD_COLOR).unwrap();
+            let grayscale = imgcodecs::imread(path.to_str().unwrap(), IMREAD_GRAYSCALE).unwrap();
+            let pairs = detect_daily_quest_progress_popup(&bgr, &grayscale);
+            println!("=== {:?}: {pairs:?}", path.file_name().unwrap());
+        }
+    }
+
     #[test]
     fn parse_daily_quest_progress_ok() {
         assert_eq!(
@@ -3712,6 +3861,25 @@ mod tests {
             parse_daily_quest_progress("Cern1um Reg on Mob 51 / 100 !"),
             Some((51, 100))
         );
+        // `/` misread as a standalone `I` - observed from real screenshots
+        assert_eq!(
+            parse_daily_quest_progress("Hotel Arcus Region Mob 19 I 100 I"),
+            Some((19, 100))
+        );
+        assert_eq!(
+            parse_daily_quest_progress("Odium Region Mob 27 I 100"),
+            Some((27, 100))
+        );
+        // A noise word landing directly between `current` and the separator, observed verbatim
+        // from real screenshots
+        assert_eq!(
+            parse_daily_quest_progress("Odium Region Mob 25 the I 100 mheat the aas"),
+            Some((25, 100))
+        );
+        assert_eq!(
+            parse_daily_quest_progress("Shangri-La Region Mob 22 mae I 300 all the fom"),
+            Some((22, 300))
+        );
     }
 
     #[test]
@@ -3719,5 +3887,15 @@ mod tests {
         assert_eq!(parse_daily_quest_progress(""), None);
         assert_eq!(parse_daily_quest_progress("Cernium Region Mob"), None);
         assert_eq!(parse_daily_quest_progress("no slash here 100"), None);
+        // `/` fused into the target's leading digit (e.g. misread as `1`) instead of landing as
+        // its own token - unrecoverable, but must not be misparsed as a real, larger `current`
+        assert_eq!(parse_daily_quest_progress("Hotel Arcus Region Mob 461 100"), None);
+        // A `current` larger than `target` must be rejected outright even when the text parses
+        // cleanly otherwise - a kill count can never exceed its own cap, so this can only be OCR
+        // corruption
+        assert_eq!(
+            parse_daily_quest_progress("Cernium Region Mob 150 / 100"),
+            None
+        );
     }
 }

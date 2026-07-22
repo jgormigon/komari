@@ -49,6 +49,9 @@ fn main() {
         resources_dir.join("monster_park_dungeon_locked_ideal_ratio.png");
     let monster_park_enter_button = resources_dir.join("monster_park_enter_button_ideal_ratio.png");
     let world_map_title = resources_dir.join("world_map_title_ideal_ratio.png");
+    let world_map_open_button = resources_dir.join("world_map_open_button_ideal_ratio.png");
+    let quest_complete = resources_dir.join("quest_complete_ideal_ratio.png");
+    let region_mob_label = resources_dir.join("region_mob_ideal_ratio.png");
     let change_channel_menu = resources_dir.join("change_channel_menu_ideal_ratio.png");
     let admin = resources_dir.join("admin_ideal_ratio.png");
     let timer = resources_dir.join("timer_ideal_ratio.png");
@@ -285,6 +288,18 @@ fn main() {
     println!(
         "cargo:rustc-env=WORLD_MAP_TITLE_TEMPLATE={}",
         world_map_title.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=WORLD_MAP_OPEN_BUTTON_TEMPLATE={}",
+        world_map_open_button.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=QUEST_COMPLETE_TEMPLATE={}",
+        quest_complete.to_str().unwrap()
+    );
+    println!(
+        "cargo:rustc-env=REGION_MOB_LABEL_TEMPLATE={}",
+        region_mob_label.to_str().unwrap()
     );
     println!(
         "cargo:rustc-env=CHANGE_CHANNEL_MENU_TEMPLATE={}",

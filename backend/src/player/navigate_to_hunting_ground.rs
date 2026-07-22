@@ -31,16 +31,22 @@ const MAP_CONTENT_OFFSET: (i32, i32, i32, i32) = (6, 73, 630, 465);
 enum State {
     /// Presses the world map key and waits for the world map UI to open.
     OpeningWorldMap(Timeout),
+    /// Clicks the minimap's "Click to open the World Map" button and waits for the world map UI
+    /// to open.
+    ///
+    /// Fallback for when [`NavigateToHuntingGround`]'s configured world map key is either not set
+    /// or didn't actually open the world map - unlike the key, this button always exists
+    /// regardless of user keybind configuration, so it's used to recover rather than aborting
+    /// outright.
+    ClickingMinimapButton(Timeout),
     /// Clicks the dropdown box at `slot` (see [`DROPDOWN_SLOT_OFFSETS`]) to open its option list.
     /// `Rect` is the world map title anchor.
     OpeningDropdown(Timeout, Rect, usize),
     /// Finds and clicks the option matching `region` (slot `0`) or the corresponding
     /// `dropdown_path` entry (slot `1`, `2`, ...).
     SelectingOption(Timeout, Rect, usize),
-    /// Finds and double-clicks the target location's node - via OCR against `location_label` if
-    /// `dropdown_path` is empty (directly on the region's own overview), or directly at
-    /// `location_point` otherwise (a deeper, tooltip-only map - see
-    /// [`NavigateToHuntingGround::location_point`]'s docs).
+    /// Double-clicks the target location's node at its verified `location_point` offset from the
+    /// anchor.
     SelectingLocation(Timeout, Rect),
     /// Finds and double-clicks the target sub-location's node label.
     ///
@@ -79,6 +85,18 @@ impl NavigatingToHuntingGround {
         1 + self.target.dropdown_path.len()
     }
 
+    /// The state to enter once the world map is open and `anchor` is known - either the first
+    /// dropdown slot not already covered by [`NavigateToHuntingGround::skip_dropdown_slots`], or
+    /// straight to selecting the location if every slot is already covered.
+    #[inline]
+    fn state_after_world_map_open(&self, anchor: Rect) -> State {
+        if self.target.skip_dropdown_slots >= self.total_dropdown_slots() {
+            State::SelectingLocation(Timeout::default(), anchor)
+        } else {
+            State::OpeningDropdown(Timeout::default(), anchor, self.target.skip_dropdown_slots)
+        }
+    }
+
     /// The text to search for in the dropdown option list at `slot`.
     #[inline]
     fn dropdown_slot_text(&self, slot: usize) -> Option<String> {
@@ -103,6 +121,9 @@ pub fn update_navigating_to_hunting_ground_state(
         State::OpeningWorldMap(_) => {
             let world_map_key = player.context.config.world_map_key;
             update_opening_world_map(resources, world_map_key, &mut navigating);
+        }
+        State::ClickingMinimapButton(_) => {
+            update_clicking_minimap_button(resources, &mut navigating)
         }
         State::OpeningDropdown(_, anchor, slot) => {
             update_opening_dropdown(resources, &mut navigating, anchor, slot)
@@ -155,11 +176,12 @@ fn update_opening_world_map(
     };
 
     let Some(world_map_key) = world_map_key else {
-        info!(
+        debug!(
             target: "backend/player",
-            "Navigating to hunting ground: aborted because world map key is not set"
+            "Navigating to hunting ground: world map key is not set, \
+             falling back to clicking the minimap button"
         );
-        navigating.state = State::Done(false);
+        navigating.state = State::ClickingMinimapButton(Timeout::default());
         return;
     };
 
@@ -172,14 +194,54 @@ fn update_opening_world_map(
             let Ok(anchor) = resources.detector().detect_world_map_title() else {
                 debug!(
                     target: "backend/player",
-                    "Navigating to hunting ground: world map did not open after pressing key"
+                    "Navigating to hunting ground: world map did not open after pressing key, \
+                     falling back to clicking the minimap button"
+                );
+                navigating.state = State::ClickingMinimapButton(Timeout::default());
+                return;
+            };
+            navigating.state = navigating.state_after_world_map_open(anchor);
+        }
+        Lifecycle::Updated(timeout) => navigating.state = State::OpeningWorldMap(timeout),
+    }
+}
+
+fn update_clicking_minimap_button(
+    resources: &mut Resources,
+    navigating: &mut NavigatingToHuntingGround,
+) {
+    let State::ClickingMinimapButton(timeout) = navigating.state else {
+        panic!("navigating to hunting ground state is not clicking minimap button")
+    };
+
+    match next_timeout_lifecycle(timeout, 35) {
+        Lifecycle::Started(timeout) => {
+            let Ok(button) = resources.detector().detect_minimap_world_map_button() else {
+                debug!(
+                    target: "backend/player",
+                    "Navigating to hunting ground: aborted because minimap world map button was \
+                     not found"
                 );
                 navigating.state = State::Done(false);
                 return;
             };
-            navigating.state = State::OpeningDropdown(Timeout::default(), anchor, 0);
+            let (cx, cy) = rect_click_point(button);
+            resources.input.send_mouse(cx, cy, MouseKind::Click);
+            navigating.state = State::ClickingMinimapButton(timeout);
         }
-        Lifecycle::Updated(timeout) => navigating.state = State::OpeningWorldMap(timeout),
+        Lifecycle::Ended => {
+            let Ok(anchor) = resources.detector().detect_world_map_title() else {
+                debug!(
+                    target: "backend/player",
+                    "Navigating to hunting ground: world map did not open after clicking the \
+                     minimap button"
+                );
+                navigating.state = State::Done(false);
+                return;
+            };
+            navigating.state = navigating.state_after_world_map_open(anchor);
+        }
+        Lifecycle::Updated(timeout) => navigating.state = State::ClickingMinimapButton(timeout),
     }
 }
 
@@ -197,7 +259,7 @@ fn update_opening_dropdown(
             target: "backend/player",
             "Navigating to hunting ground: dropdown slot {slot} is not supported"
         );
-        navigating.state = State::Done(false);
+        abort_and_close_world_map(resources, navigating);
         return;
     };
 
@@ -234,7 +296,7 @@ fn update_selecting_option(
                     target: "backend/player",
                     "Navigating to hunting ground: no dropdown option configured for slot {slot}"
                 );
-                navigating.state = State::Done(false);
+                abort_and_close_world_map(resources, navigating);
                 return;
             };
             let (x, y, width, _) = DROPDOWN_SLOT_OFFSETS[slot];
@@ -248,7 +310,7 @@ fn update_selecting_option(
                     target: "backend/player",
                     "Navigating to hunting ground: dropdown option `{text}` not found"
                 );
-                navigating.state = State::Done(false);
+                abort_and_close_world_map(resources, navigating);
                 return;
             };
             let (cx, cy) = rect_click_point(option);
@@ -279,42 +341,24 @@ fn update_selecting_location(
 
     match next_timeout_lifecycle(timeout, 20) {
         Lifecycle::Started(timeout) => {
-            let (cx, cy) = if navigating.target.dropdown_path.is_empty() {
-                let (x, y, width, height) = MAP_CONTENT_OFFSET;
-                let content_roi = Rect::new(anchor.x + x, anchor.y + y, width, height);
-                let Ok(node) = resources
-                    .detector()
-                    .detect_world_map_label(content_roi, &navigating.target.location_label)
-                else {
-                    debug!(
-                        target: "backend/player",
-                        "Navigating to hunting ground: location `{}` not found",
-                        navigating.target.location_label
-                    );
-                    navigating.state = State::Done(false);
-                    return;
-                };
-                rect_click_point(node)
-            } else {
-                let (px, py) = navigating.target.location_point;
-                (anchor.x + px, anchor.y + py)
-            };
+            let (px, py) = navigating.target.location_point;
+            let (cx, cy) = (anchor.x + px, anchor.y + py);
             resources.input.send_mouse(cx, cy, MouseKind::Click);
             resources.input.send_mouse(cx, cy, MouseKind::Click);
             navigating.state = State::SelectingLocation(timeout, anchor);
         }
         Lifecycle::Ended => {
-            navigating.state = if resources.detector().detect_popup_confirm_button().is_ok() {
-                State::ConfirmingTeleport(Timeout::default())
+            if resources.detector().detect_popup_confirm_button().is_ok() {
+                navigating.state = State::ConfirmingTeleport(Timeout::default());
             } else if navigating.target.sub_location_label.is_some() {
-                State::SelectingSubLocation(Timeout::default(), anchor)
+                navigating.state = State::SelectingSubLocation(Timeout::default(), anchor);
             } else {
                 debug!(
                     target: "backend/player",
                     "Navigating to hunting ground: no teleport confirm popup after selecting location"
                 );
-                State::Done(false)
-            };
+                abort_and_close_world_map(resources, navigating);
+            }
         }
         Lifecycle::Updated(timeout) => {
             navigating.state = State::SelectingLocation(timeout, anchor);
@@ -331,7 +375,7 @@ fn update_selecting_sub_location(
         panic!("navigating to hunting ground state is not selecting sub location")
     };
     let Some(sub_location_label) = navigating.target.sub_location_label.clone() else {
-        navigating.state = State::Done(false);
+        abort_and_close_world_map(resources, navigating);
         return;
     };
 
@@ -347,7 +391,7 @@ fn update_selecting_sub_location(
                     target: "backend/player",
                     "Navigating to hunting ground: sub-location `{sub_location_label}` not found"
                 );
-                navigating.state = State::Done(false);
+                abort_and_close_world_map(resources, navigating);
                 return;
             };
             let (cx, cy) = rect_click_point(node);
@@ -356,15 +400,15 @@ fn update_selecting_sub_location(
             navigating.state = State::SelectingSubLocation(timeout, anchor);
         }
         Lifecycle::Ended => {
-            navigating.state = if resources.detector().detect_popup_confirm_button().is_ok() {
-                State::ConfirmingTeleport(Timeout::default())
+            if resources.detector().detect_popup_confirm_button().is_ok() {
+                navigating.state = State::ConfirmingTeleport(Timeout::default());
             } else {
                 debug!(
                     target: "backend/player",
                     "Navigating to hunting ground: no teleport confirm popup after selecting sub-location"
                 );
-                State::Done(false)
-            };
+                abort_and_close_world_map(resources, navigating);
+            }
         }
         Lifecycle::Updated(timeout) => {
             navigating.state = State::SelectingSubLocation(timeout, anchor);
@@ -387,7 +431,7 @@ fn update_confirming_teleport(
                     target: "backend/player",
                     "Navigating to hunting ground: Confirm button not found"
                 );
-                navigating.state = State::Done(false);
+                abort_and_close_world_map(resources, navigating);
                 return;
             };
             let (cx, cy) = rect_click_point(button);
@@ -409,4 +453,20 @@ fn rect_click_point(rect: Rect) -> (i32, i32) {
     let x = rect.x + rect.width / 2;
     let y = rect.y + rect.height / 2;
     (x, y)
+}
+
+/// Presses Esc to close the world map before giving up on navigation.
+///
+/// Only called from states that already carry an `anchor` (i.e. after
+/// [`crate::detect::Detector::detect_world_map_title`] has confirmed the world map is open) - a
+/// failure at that point still leaves the world map open on screen, which keeps covering the
+/// minimap and breaking minimap-dependent detection (and anything relying on it, e.g. panic mode)
+/// for the rest of the run instead of just aborting this one navigation attempt.
+#[inline]
+fn abort_and_close_world_map(
+    resources: &mut Resources,
+    navigating: &mut NavigatingToHuntingGround,
+) {
+    resources.input.send_key(KeyKind::Esc);
+    navigating.state = State::Done(false);
 }
