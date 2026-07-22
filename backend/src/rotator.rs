@@ -23,7 +23,7 @@ use crate::{
     buff::{Buff, BuffKind},
     detect::{Detector, QuickSlotsHexaBooster, SolErda},
     ecs::{Resources, World},
-    minimap::Minimap,
+    minimap::{Minimap, MinimapContext},
     models::{
         Action, ActionCondition, ActionKey, ActionKeyDirection, ActionKeyWith, ActionMove,
         DailyQuestEntry, DailyQuestNavigation, EliteBossBehavior, ExchangeHexaBoosterCondition,
@@ -31,6 +31,7 @@ use crate::{
     },
     notification::NotificationKind,
     operation::OperationState,
+    pathing::Platform,
     player::{
         AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
         GRAPPLING_THRESHOLD, Key, Move, NavigateToHuntingGround, Panic, PanicTo, PingPong,
@@ -70,6 +71,12 @@ const DAILY_QUEST_PROGRESS_POLL_MILLIS: u64 = 1500;
 /// Poll interval for [`DefaultRotator::daily_quest_complete_task`] - kept short since a miss
 /// (template not found) is cheap and the toast itself only renders briefly.
 const DAILY_QUEST_COMPLETE_POLL_MILLIS: u64 = 1000;
+
+/// `auto_mob_use_key_when_pathing_update_millis` applied while platform-pathing a daily quest
+/// entry that has recorded platforms (see [`crate::models::DailyQuestId::platforms`]) - a plain
+/// fixed default since, unlike a user-authored [`crate::models::Map`], there's no per-hunting-
+/// ground value configured for this.
+const DAILY_QUEST_AUTO_MOB_USE_KEY_UPDATE_MILLIS: u64 = 500;
 
 /// Number of leading dropdown slots (region, then each `dropdown_path` entry in order) `current`
 /// shares with `previous` - see [`NavigateToHuntingGround::skip_dropdown_slots`].
@@ -239,6 +246,10 @@ pub struct RotatorBuildArgs {
     pub daily_quest_entries: Vec<DailyQuestEntry>,
     /// Mobbing key shared by every daily quest entry.
     pub daily_quest_mobbing_key: MobbingKey,
+    /// The id of the character [`Self::daily_quest_entries`] belongs to, if saved.
+    ///
+    /// See [`DefaultRotator::daily_quest_character_id`].
+    pub daily_quest_character_id: Option<i64>,
 }
 
 /// Handles rotating provided [`PlayerAction`]s.
@@ -276,6 +287,17 @@ pub trait Rotator: Debug + 'static {
     /// If [`Operation`] is currently halting, it does not rotate the built actions but only the
     /// side-loaded actions added by [`Self::inject_action`].
     fn rotate_action(&mut self, resources: &mut Resources, world: &mut World);
+}
+
+/// Snapshot of platform-pathing state overwritten while a daily quest run is applying its own
+/// hunting ground's platforms - see [`DefaultRotator::daily_quest_saved_pathing`].
+#[derive(Clone, Debug)]
+struct DailyQuestSavedPathing {
+    platforms: Vec<Platform>,
+    auto_mob_platforms_pathing: bool,
+    auto_mob_platforms_pathing_up_jump_only: bool,
+    auto_mob_use_key_when_pathing: bool,
+    auto_mob_use_key_when_pathing_update_millis: u64,
 }
 
 #[derive(Default, Debug)]
@@ -401,6 +423,15 @@ pub struct DefaultRotator {
     /// Mobbing key shared by every daily quest entry, from
     /// [`RotatorBuildArgs::daily_quest_mobbing_key`].
     daily_quest_mobbing_key: MobbingKey,
+    /// The id of the character [`Self::daily_quest_entries`] belongs to, from
+    /// [`RotatorBuildArgs::daily_quest_character_id`].
+    ///
+    /// Threaded through to [`crate::ecs::CharacterUpdates::mark_daily_quest_completed`] so a
+    /// completion is persisted against the character this run is actually for, not whichever
+    /// character happens to be selected in `CharacterService` at the moment the tick loop drains
+    /// it - those can diverge if the user switches the selected character in the UI while a
+    /// previous character's daily quest run is still in flight.
+    daily_quest_character_id: Option<i64>,
     /// Index into [`Self::daily_quest_entries`] of the currently active entry.
     ///
     /// Once this reaches `daily_quest_entries.len()`, all configured dailies for this run have
@@ -438,6 +469,16 @@ pub struct DefaultRotator {
     /// must not clear a previous hit - latched `true` until [`Self::rotate_daily_quest`] resets it
     /// on completion, or navigation failure/pause resets it early.
     daily_quest_complete_popup_detected: bool,
+    /// The minimap platforms and [`PlayerContext::config`] platform-pathing settings as they were
+    /// just before the first daily quest entry of this run applied its own (see
+    /// [`DailyQuestId::platforms`](crate::models::DailyQuestId::platforms)).
+    ///
+    /// The daily quest solver has no [`crate::models::Map`] of its own to carry this
+    /// configuration, so [`Self::rotate_daily_quest`] borrows the regular auto-mobbing plumbing
+    /// directly - `Some` for the duration of a daily quest run and restored once
+    /// [`Self::daily_quest_index`] reaches [`Self::daily_quest_entries`]'s length, so farming under
+    /// the character's actual map isn't left running with a hunting ground's platforms afterward.
+    daily_quest_saved_pathing: Option<DailyQuestSavedPathing>,
 
     priority_actions: OrderedHashMap<u32, PriorityAction>,
     /// The currently executing [`RotatorAction::Linked`] action
@@ -803,6 +844,7 @@ impl DefaultRotator {
         &mut self,
         resources: &mut Resources,
         player_context: &mut PlayerContext,
+        minimap_context: &mut MinimapContext,
         minimap_state: Minimap,
     ) {
         let Some(entry) = self
@@ -817,6 +859,35 @@ impl DefaultRotator {
             if player_context.has_normal_action() || player_context.has_priority_action() {
                 return;
             }
+
+            if self.daily_quest_saved_pathing.is_none() {
+                self.daily_quest_saved_pathing = Some(DailyQuestSavedPathing {
+                    platforms: minimap_context.platforms().to_vec(),
+                    auto_mob_platforms_pathing: player_context.config.auto_mob_platforms_pathing,
+                    auto_mob_platforms_pathing_up_jump_only: player_context
+                        .config
+                        .auto_mob_platforms_pathing_up_jump_only,
+                    auto_mob_use_key_when_pathing: player_context
+                        .config
+                        .auto_mob_use_key_when_pathing,
+                    auto_mob_use_key_when_pathing_update_millis: player_context
+                        .config
+                        .auto_mob_use_key_when_pathing_update_millis,
+                });
+            }
+            // The daily quest solver has no `Map` of its own to draw platforms on - apply this
+            // entry's recorded platforms (if any) the same way selecting a regular farming map
+            // would, so auto-mobbing here can path around the hunting ground's layout instead of
+            // blindly grappling/jumping toward mobs it can't reach directly. Entries without
+            // recorded platforms yet are left exactly as before (pathing disabled).
+            let platforms = entry.id.platforms();
+            let has_platforms = !platforms.is_empty();
+            minimap_context.set_platforms(platforms.into_iter().map(Platform::from).collect());
+            player_context.config.auto_mob_platforms_pathing = has_platforms;
+            player_context.config.auto_mob_platforms_pathing_up_jump_only = false;
+            player_context.config.auto_mob_use_key_when_pathing = has_platforms;
+            player_context.config.auto_mob_use_key_when_pathing_update_millis =
+                DAILY_QUEST_AUTO_MOB_USE_KEY_UPDATE_MILLIS;
 
             let navigation = entry.id.navigation();
             let skip_dropdown_slots = self
@@ -925,7 +996,7 @@ impl DefaultRotator {
             );
             resources
                 .character_updates
-                .mark_daily_quest_completed(entry.id);
+                .mark_daily_quest_completed(self.daily_quest_character_id, entry.id);
             self.daily_quest_index += 1;
             self.daily_quest_navigating = false;
             self.auto_mob_task = None;
@@ -935,6 +1006,17 @@ impl DefaultRotator {
             self.daily_quest_complete_task = None;
             self.daily_quest_complete_popup_detected = false;
             if self.daily_quest_index >= self.daily_quest_entries.len() {
+                if let Some(saved) = self.daily_quest_saved_pathing.take() {
+                    minimap_context.set_platforms(saved.platforms);
+                    player_context.config.auto_mob_platforms_pathing =
+                        saved.auto_mob_platforms_pathing;
+                    player_context.config.auto_mob_platforms_pathing_up_jump_only =
+                        saved.auto_mob_platforms_pathing_up_jump_only;
+                    player_context.config.auto_mob_use_key_when_pathing =
+                        saved.auto_mob_use_key_when_pathing;
+                    player_context.config.auto_mob_use_key_when_pathing_update_millis =
+                        saved.auto_mob_use_key_when_pathing_update_millis;
+                }
                 resources
                     .notification
                     .schedule_notification(NotificationKind::DailyQuestCompleted);
@@ -1715,6 +1797,7 @@ impl Rotator for DefaultRotator {
             enable_using_hexa_booster,
             daily_quest_entries,
             daily_quest_mobbing_key,
+            daily_quest_character_id,
         } = args;
         self.reset_queue();
         self.normal_actions.clear();
@@ -1724,6 +1807,8 @@ impl Rotator for DefaultRotator {
         self.priority_actions.clear();
         self.daily_quest_entries = daily_quest_entries;
         self.daily_quest_mobbing_key = daily_quest_mobbing_key;
+        self.daily_quest_character_id = daily_quest_character_id;
+        self.daily_quest_saved_pathing = None;
         self.daily_quest_index = 0;
 
         // Monster Park is a tight, timed sweep-then-portal loop across several maps - buffs,
@@ -1912,7 +1997,12 @@ impl Rotator for DefaultRotator {
         self.rotate_priority_actions_queue(&mut world.player);
 
         if self.daily_quest_index < self.daily_quest_entries.len() {
-            self.rotate_daily_quest(resources, &mut world.player.context, world.minimap.state);
+            self.rotate_daily_quest(
+                resources,
+                &mut world.player.context,
+                &mut world.minimap.context,
+                world.minimap.state,
+            );
             return;
         }
 
@@ -2728,6 +2818,7 @@ mod tests {
             enable_using_hexa_booster: false,
             daily_quest_entries: vec![],
             daily_quest_mobbing_key: MobbingKey::default(),
+            daily_quest_character_id: None,
         };
 
         rotator.build_actions(args);

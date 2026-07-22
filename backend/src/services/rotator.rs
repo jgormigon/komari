@@ -92,6 +92,7 @@ impl RotatorService for DefaultRotatorService {
         self.args.daily_quest_mobbing_key = character
             .map(|character| character.daily_quest_mobbing_key)
             .unwrap_or_default();
+        self.args.daily_quest_character_id = character.and_then(|character| character.id);
     }
 
     fn update_from_settings(&mut self, settings: &Settings) {

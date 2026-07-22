@@ -153,7 +153,13 @@ pub fn update_unstucking_state(
                         (_, Some(pos)) if pos.y > Y_IGNORE_THRESHOLD => true,
                         _ => false,
                     };
-                    if send_space {
+                    // Coin-flip instead of pressing every tick - repeated stuck detection can
+                    // chain many of these states back to back, and a jump key firing on every
+                    // single ~33ms tick with zero variance is a distinctly bot-like input pattern
+                    // (this was observed triggering the in-game lie detector check). Skipping
+                    // roughly half the ticks still keeps the player jumping regularly enough to
+                    // recover while breaking up the perfectly uniform cadence.
+                    if send_space && resources.rng.random_bool(0.5) {
                         resources.input.send_key(context.config.jump_key);
                     }
 

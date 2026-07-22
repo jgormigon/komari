@@ -85,18 +85,28 @@ impl Debug {
 /// `Services::poll` drains this every tick (from a point that does have `CharacterService`
 /// access) to actually update and re-save the character. Mirrors [`Notification`]'s shape as the
 /// existing precedent for a [`Resources`] field usable directly from deep tick code.
+///
+/// Each entry carries the id of the character the rotator was actually built for (see
+/// [`crate::rotator::DefaultRotator::daily_quest_character_id`]) alongside the completed
+/// [`DailyQuestId`] - the currently *selected* character in `CharacterService` can differ from
+/// that (e.g. the user switched characters in the UI while a previous character's daily quest run
+/// was still in flight), and persisting against whichever character happens to be selected at
+/// drain time would silently mark the wrong character's entry as completed.
 #[derive(Debug, Default, Clone)]
 pub struct CharacterUpdates {
-    completed_daily_quests: Arc<Mutex<Vec<DailyQuestId>>>,
+    completed_daily_quests: Arc<Mutex<Vec<(Option<i64>, DailyQuestId)>>>,
 }
 
 impl CharacterUpdates {
-    pub fn mark_daily_quest_completed(&self, id: DailyQuestId) {
-        self.completed_daily_quests.lock().unwrap().push(id);
+    pub fn mark_daily_quest_completed(&self, character_id: Option<i64>, id: DailyQuestId) {
+        self.completed_daily_quests
+            .lock()
+            .unwrap()
+            .push((character_id, id));
     }
 
     /// Takes and clears all completed daily quest ids marked since the last drain.
-    pub fn drain_completed_daily_quests(&self) -> Vec<DailyQuestId> {
+    pub fn drain_completed_daily_quests(&self) -> Vec<(Option<i64>, DailyQuestId)> {
         mem::take(&mut *self.completed_daily_quests.lock().unwrap())
     }
 }
