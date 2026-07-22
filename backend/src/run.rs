@@ -22,7 +22,7 @@ use crate::{
     buff::{self, Buff, BuffContext, BuffEntity, BuffKind},
     database::{query_and_upsert_seeds, query_or_upsert_localization, query_settings},
     detect::{DefaultDetector, Detector},
-    ecs::{Resources, World, WorldEvent},
+    ecs::{CharacterUpdates, Resources, World, WorldEvent},
     mat::OwnedMat,
     minimap::{self, Minimap, MinimapContext, MinimapEntity},
     notification::Notification,
@@ -95,6 +95,7 @@ fn systems_loop() {
         input: Box::new(input),
         rng,
         notification,
+        character_updates: CharacterUpdates::default(),
         detector: None,
         operation: Operation {
             config: OperationConfiguration::from(&*settings.borrow()),

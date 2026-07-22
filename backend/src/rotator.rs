@@ -23,16 +23,19 @@ use crate::{
     buff::{Buff, BuffKind},
     detect::{Detector, QuickSlotsHexaBooster, SolErda},
     ecs::{Resources, World},
-    minimap::Minimap,
+    minimap::{Minimap, MinimapContext},
     models::{
         Action, ActionCondition, ActionKey, ActionKeyDirection, ActionKeyWith, ActionMove,
-        EliteBossBehavior, ExchangeHexaBoosterCondition, Familiars, MobbingKey, Position,
-        WaitAfterBuffered,
+        DailyQuestEntry, DailyQuestNavigation, EliteBossBehavior, ExchangeHexaBoosterCondition,
+        Familiars, MobbingKey, Position, WaitAfterBuffered,
     },
+    notification::NotificationKind,
+    operation::OperationState,
+    pathing::Platform,
     player::{
         AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
-        GRAPPLING_THRESHOLD, Key, Move, Panic, PanicTo, PingPong, PingPongDirection, PlayerAction,
-        PlayerContext, PlayerEntity, Quadrant, UseBooster,
+        GRAPPLING_THRESHOLD, Key, Move, NavigateToHuntingGround, Panic, PanicTo, PingPong,
+        PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant, UseBooster,
     },
     run::MS_PER_TICK,
     skill::{Skill, SkillKind},
@@ -40,6 +43,63 @@ use crate::{
 };
 
 const AUTO_MOB_SAME_QUAD_THRESHOLD: u32 = 5;
+
+/// Width of the OCR region scanned below a matched "Quest complete!" toast (see
+/// [`DefaultRotator::rotate_daily_quest`]) for its second line (e.g. `"[Daily Quest] Chu Chu
+/// Island"`) - generous to fit the longest hunting ground names.
+const DAILY_QUEST_COMPLETE_LABEL_ROI_WIDTH: i32 = 300;
+/// Extra height, beyond the matched toast's own height, of the OCR region scanned for its second
+/// line.
+const DAILY_QUEST_COMPLETE_LABEL_ROI_PADDING: i32 = 24;
+
+/// Poll interval for [`DefaultRotator::daily_quest_progress_task`].
+///
+/// [`crate::detect::Detector::detect_daily_quest_progress_popup`] used to always run a full OCR
+/// pass regardless of whether the banner was even on screen - logs from a live run showed that
+/// taking multiple seconds end to end and visibly stalling mob detection for its duration each
+/// time it fired (both run as ONNX inference and contend for the same CPU), while never once
+/// successfully parsing a value that whole run - the toast check alone (see
+/// [`DefaultRotator::daily_quest_complete_task`]) drove every completion.
+///
+/// It's now gated by a cheap template match on the constant `"Region Mob"` substring first, the
+/// same shape as [`crate::detect::Detector::detect_quest_complete_popup`] - a miss costs about as
+/// little as that toast check, and only a match pays for OCR, on a small region rather than the
+/// previous generous one. That makes the kill-count popup cheap enough to poll about as often as
+/// the toast, even though it remains just a backup signal for the rare case the toast itself is
+/// missed.
+const DAILY_QUEST_PROGRESS_POLL_MILLIS: u64 = 1500;
+/// Poll interval for [`DefaultRotator::daily_quest_complete_task`] - kept short since a miss
+/// (template not found) is cheap and the toast itself only renders briefly.
+const DAILY_QUEST_COMPLETE_POLL_MILLIS: u64 = 1000;
+
+/// `auto_mob_use_key_when_pathing_update_millis` applied while platform-pathing a daily quest
+/// entry that has recorded platforms (see [`crate::models::DailyQuestId::platforms`]) - a plain
+/// fixed default since, unlike a user-authored [`crate::models::Map`], there's no per-hunting-
+/// ground value configured for this.
+const DAILY_QUEST_AUTO_MOB_USE_KEY_UPDATE_MILLIS: u64 = 500;
+
+/// Number of leading dropdown slots (region, then each `dropdown_path` entry in order) `current`
+/// shares with `previous` - see [`NavigateToHuntingGround::skip_dropdown_slots`].
+///
+/// The world map keeps its dropdown selections as-is across being closed and reopened, so
+/// consecutive daily quest entries sharing a region (and possibly deeper dropdown path) don't
+/// need to re-select that shared prefix - it's already showing from the previous entry's
+/// navigation.
+fn shared_dropdown_prefix_len(
+    previous: &DailyQuestNavigation,
+    current: &DailyQuestNavigation,
+) -> usize {
+    if previous.region != current.region {
+        return 0;
+    }
+
+    1 + previous
+        .dropdown_path
+        .iter()
+        .zip(current.dropdown_path.iter())
+        .take_while(|(prev, cur)| prev == cur)
+        .count()
+}
 
 /// [`Condition`] evaluation result.
 #[derive(Debug)]
@@ -88,6 +148,19 @@ struct PriorityAction {
     metadata: Option<ActionMetadata>,
     /// Whether to queue this action to the front of [`Rotator::priority_actions_queue`].
     queue_to_front: bool,
+    /// Whether this action should not be newly queued while a daily quest entry is pending (see
+    /// [`DefaultRotator::daily_quest_index`]).
+    ///
+    /// Regular grinding assists (buffs, boosters, familiar swapping, elite boss/panic channel
+    /// changing, the map's own fixed-position skill actions) are tied to the currently selected
+    /// farming map and either make no sense or are actively disruptive while the player is off
+    /// navigating to and mobbing a daily quest hunting ground instead - worse, a fixed-position
+    /// action (e.g. an `ErdaShowerOffCooldown` skill bound to a spot on the farming map) can keep
+    /// re-queuing back-to-back indefinitely, starving [`DefaultRotator::rotate_daily_quest`] of
+    /// the "no priority action" tick it needs to ever start navigating. Safety/anti-bot actions
+    /// (unstuck, rune/shape/violetta solving) are left unsuppressed since they can matter
+    /// regardless of what the player is currently doing.
+    suppress_during_daily_quest: bool,
     queue_info: PriorityActionQueueInfo,
 }
 
@@ -167,6 +240,16 @@ pub struct RotatorBuildArgs {
     pub enable_reset_normal_actions_on_erda: bool,
     pub enable_using_generic_booster: bool,
     pub enable_using_hexa_booster: bool,
+    /// Daily quest hunting-ground checklist to run before the map's normal [`RotatorMode`].
+    ///
+    /// See [`DefaultRotator::rotate_daily_quest`].
+    pub daily_quest_entries: Vec<DailyQuestEntry>,
+    /// Mobbing key shared by every daily quest entry.
+    pub daily_quest_mobbing_key: MobbingKey,
+    /// The id of the character [`Self::daily_quest_entries`] belongs to, if saved.
+    ///
+    /// See [`DefaultRotator::daily_quest_character_id`].
+    pub daily_quest_character_id: Option<i64>,
 }
 
 /// Handles rotating provided [`PlayerAction`]s.
@@ -177,6 +260,15 @@ pub trait Rotator: Debug + 'static {
 
     /// The currently built [`RotatorMode`].
     fn mode(&self) -> RotatorMode;
+
+    /// Whether a daily quest entry is currently being navigated to or mobbed at (see
+    /// [`DefaultRotator::daily_quest_navigating`]).
+    ///
+    /// Used by the world event handler to exempt the map changes this causes (opening the world
+    /// map covers the minimap; teleporting actually changes it) from the "unexpected map change"
+    /// watchdog, the same way [`RotatorMode::MonsterPark`] is exempted for its own portal-driven
+    /// map changes.
+    fn is_navigating_daily_quest(&self) -> bool;
 
     /// Resets priority and normal actions queues.
     ///
@@ -195,6 +287,17 @@ pub trait Rotator: Debug + 'static {
     /// If [`Operation`] is currently halting, it does not rotate the built actions but only the
     /// side-loaded actions added by [`Self::inject_action`].
     fn rotate_action(&mut self, resources: &mut Resources, world: &mut World);
+}
+
+/// Snapshot of platform-pathing state overwritten while a daily quest run is applying its own
+/// hunting ground's platforms - see [`DefaultRotator::daily_quest_saved_pathing`].
+#[derive(Clone, Debug)]
+struct DailyQuestSavedPathing {
+    platforms: Vec<Platform>,
+    auto_mob_platforms_pathing: bool,
+    auto_mob_platforms_pathing_up_jump_only: bool,
+    auto_mob_use_key_when_pathing: bool,
+    auto_mob_use_key_when_pathing_update_millis: u64,
 }
 
 #[derive(Default, Debug)]
@@ -309,6 +412,73 @@ pub struct DefaultRotator {
     /// [`MONSTER_PARK_GATE_ATTEMPT_LIMIT`], stop pressing Up and re-verify the player's position
     /// instead of retrying forever.
     monster_park_gate_attempts: u32,
+
+    /// Configured daily quest entries for [`Self::rotate_daily_quest`], from
+    /// [`RotatorBuildArgs::daily_quest_entries`].
+    ///
+    /// Only assigned in [`Self::build_actions`] - unlike the other `daily_quest_*` fields below,
+    /// this and [`Self::daily_quest_index`] represent actual checklist progress and must survive
+    /// a pause/resume (see [`Self::reset_queue`]), not just in-flight per-tick tracking.
+    daily_quest_entries: Vec<DailyQuestEntry>,
+    /// Mobbing key shared by every daily quest entry, from
+    /// [`RotatorBuildArgs::daily_quest_mobbing_key`].
+    daily_quest_mobbing_key: MobbingKey,
+    /// The id of the character [`Self::daily_quest_entries`] belongs to, from
+    /// [`RotatorBuildArgs::daily_quest_character_id`].
+    ///
+    /// Threaded through to [`crate::ecs::CharacterUpdates::mark_daily_quest_completed`] so a
+    /// completion is persisted against the character this run is actually for, not whichever
+    /// character happens to be selected in `CharacterService` at the moment the tick loop drains
+    /// it - those can diverge if the user switches the selected character in the UI while a
+    /// previous character's daily quest run is still in flight.
+    daily_quest_character_id: Option<i64>,
+    /// Index into [`Self::daily_quest_entries`] of the currently active entry.
+    ///
+    /// Once this reaches `daily_quest_entries.len()`, all configured dailies for this run have
+    /// been completed and [`Self::rotate_action`] falls through to the map's normal
+    /// [`RotatorMode`] instead of calling [`Self::rotate_daily_quest`].
+    daily_quest_index: usize,
+    /// Whether [`PlayerAction::NavigateToHuntingGround`] has already been issued for the entry at
+    /// [`Self::daily_quest_index`].
+    ///
+    /// Reset on [`Self::reset_queue`] (e.g. on pause) since a pause also aborts any in-flight
+    /// navigation - unlike [`Self::daily_quest_index`], this is transient per-attempt tracking.
+    daily_quest_navigating: bool,
+    /// Background task scanning for the kill-count popup while mobbing at a daily quest's
+    /// hunting ground (see [`Self::rotate_daily_quest`]).
+    ///
+    /// Still run off-thread rather than called inline every tick even though
+    /// [`crate::detect::Detector::detect_daily_quest_progress_popup`] is now a cheap template
+    /// match gate most of the time - an actual match still pays for OCR inline with the tick loop
+    /// otherwise, and doing that was observed stretching individual ticks out to 5+ seconds for as
+    /// long as mobbing continued, stalling everything else (movement, mob detection, minimap
+    /// re-detection) right along with it, back when every poll paid that cost unconditionally.
+    /// Same reasoning as [`Self::monster_park_portal_task`].
+    daily_quest_progress_task: Option<Task<Result<Vec<(u32, u32)>>>>,
+    /// Last progress scan result from [`Self::daily_quest_progress_task`].
+    ///
+    /// Left unchanged while a scan is still in flight or fails, same reasoning as
+    /// [`Self::monster_park_enemies`].
+    daily_quest_progress: Vec<(u32, u32)>,
+    /// Background task scanning for the "Quest complete!" toast confirmed as a daily quest (see
+    /// [`Self::rotate_daily_quest`]), same reasoning as [`Self::daily_quest_progress_task`].
+    daily_quest_complete_task: Option<Task<Result<()>>>,
+    /// Whether [`Self::daily_quest_complete_task`] has ever matched the current entry.
+    ///
+    /// The toast only renders for a few seconds, so unlike [`Self::daily_quest_progress`] a miss
+    /// must not clear a previous hit - latched `true` until [`Self::rotate_daily_quest`] resets it
+    /// on completion, or navigation failure/pause resets it early.
+    daily_quest_complete_popup_detected: bool,
+    /// The minimap platforms and [`PlayerContext::config`] platform-pathing settings as they were
+    /// just before the first daily quest entry of this run applied its own (see
+    /// [`DailyQuestId::platforms`](crate::models::DailyQuestId::platforms)).
+    ///
+    /// The daily quest solver has no [`crate::models::Map`] of its own to carry this
+    /// configuration, so [`Self::rotate_daily_quest`] borrows the regular auto-mobbing plumbing
+    /// directly - `Some` for the duration of a daily quest run and restored once
+    /// [`Self::daily_quest_index`] reaches [`Self::daily_quest_entries`]'s length, so farming under
+    /// the character's actual map isn't left running with a hunting ground's platforms afterward.
+    daily_quest_saved_pathing: Option<DailyQuestSavedPathing>,
 
     priority_actions: OrderedHashMap<u32, PriorityAction>,
     /// The currently executing [`RotatorAction::Linked`] action
@@ -450,6 +620,9 @@ impl DefaultRotator {
         let has_erda_action = has_erda_action_queuing_or_executing(self, &world.player.context);
         let ids = self.priority_actions.keys().copied().collect::<Vec<_>>();
         let mut did_queue_erda_action = false;
+        // See `PriorityAction::suppress_during_daily_quest`'s docs for why these are held back
+        // from being newly queued while a daily quest entry is still pending.
+        let daily_quest_active = self.daily_quest_index < self.daily_quest_entries.len();
 
         for id in ids {
             // Ignores for as long as the action is a linked action that is queuing
@@ -478,6 +651,9 @@ impl DefaultRotator {
             };
             if action.queue_info.ignoring {
                 action.queue_info.last_queued_time = Some(Instant::now());
+                continue;
+            }
+            if daily_quest_active && action.suppress_during_daily_quest {
                 continue;
             }
 
@@ -650,6 +826,232 @@ impl DefaultRotator {
                 self.rotate_queuing_linked_action(&mut player.context, true);
             }
         }
+    }
+
+    /// Runs the daily quest checklist at [`Self::daily_quest_index`], if any is still pending.
+    ///
+    /// For the active entry, this navigates to its hunting ground (via
+    /// [`PlayerAction::NavigateToHuntingGround`]), then delegates to
+    /// [`Self::rotate_auto_mobbing`] using the entry's own [`DailyQuestEntry::bound`] and
+    /// [`DailyQuestEntry::mobbing_key`] - the mobbing behavior itself is identical to regular
+    /// auto-mobbing, only which map and area differ. Advances to the next entry once
+    /// [`Detector::detect_daily_quest_progress_popup`] reports the kill quota reached.
+    ///
+    /// Called from [`Self::rotate_action`] before the map's normal [`RotatorMode`] dispatch -
+    /// once every configured entry is completed, subsequent calls fall through to that normal
+    /// dispatch instead, so the bot then farms the current map as configured.
+    fn rotate_daily_quest(
+        &mut self,
+        resources: &mut Resources,
+        player_context: &mut PlayerContext,
+        minimap_context: &mut MinimapContext,
+        minimap_state: Minimap,
+    ) {
+        let Some(entry) = self
+            .daily_quest_entries
+            .get(self.daily_quest_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        if !self.daily_quest_navigating {
+            if player_context.has_normal_action() || player_context.has_priority_action() {
+                return;
+            }
+
+            if self.daily_quest_saved_pathing.is_none() {
+                self.daily_quest_saved_pathing = Some(DailyQuestSavedPathing {
+                    platforms: minimap_context.platforms().to_vec(),
+                    auto_mob_platforms_pathing: player_context.config.auto_mob_platforms_pathing,
+                    auto_mob_platforms_pathing_up_jump_only: player_context
+                        .config
+                        .auto_mob_platforms_pathing_up_jump_only,
+                    auto_mob_use_key_when_pathing: player_context
+                        .config
+                        .auto_mob_use_key_when_pathing,
+                    auto_mob_use_key_when_pathing_update_millis: player_context
+                        .config
+                        .auto_mob_use_key_when_pathing_update_millis,
+                });
+            }
+            // The daily quest solver has no `Map` of its own to draw platforms on - apply this
+            // entry's recorded platforms (if any) the same way selecting a regular farming map
+            // would, so auto-mobbing here can path around the hunting ground's layout instead of
+            // blindly grappling/jumping toward mobs it can't reach directly. Entries without
+            // recorded platforms yet are left exactly as before (pathing disabled).
+            let platforms = entry.id.platforms();
+            let has_platforms = !platforms.is_empty();
+            minimap_context.set_platforms(platforms.into_iter().map(Platform::from).collect());
+            player_context.config.auto_mob_platforms_pathing = has_platforms;
+            player_context
+                .config
+                .auto_mob_platforms_pathing_up_jump_only = false;
+            player_context.config.auto_mob_use_key_when_pathing = has_platforms;
+            player_context
+                .config
+                .auto_mob_use_key_when_pathing_update_millis =
+                DAILY_QUEST_AUTO_MOB_USE_KEY_UPDATE_MILLIS;
+
+            let navigation = entry.id.navigation();
+            let skip_dropdown_slots = self
+                .daily_quest_index
+                .checked_sub(1)
+                .map(|prev_index| self.daily_quest_entries[prev_index].id.navigation())
+                .map(|previous| shared_dropdown_prefix_len(&previous, &navigation))
+                .unwrap_or(0);
+            debug!(
+                target: "backend/rotator",
+                "Daily Quest: navigating to {} (skipping {skip_dropdown_slots} already-selected \
+                 dropdown slot(s))",
+                navigation.location_label
+            );
+            player_context.set_priority_action(
+                None,
+                PlayerAction::NavigateToHuntingGround(NavigateToHuntingGround {
+                    region: navigation.region,
+                    dropdown_path: navigation.dropdown_path,
+                    location_point: navigation.location_point,
+                    sub_location_label: navigation.sub_location_label,
+                    skip_dropdown_slots,
+                }),
+            );
+            self.daily_quest_navigating = true;
+            return;
+        }
+
+        if player_context.has_priority_action() {
+            // Still navigating
+            return;
+        }
+
+        if player_context.take_daily_quest_navigate_failed() {
+            // Navigation didn't actually reach the hunting ground (e.g. world map key not
+            // configured, an expected UI element wasn't found) - `has_priority_action()` clears
+            // the same way on failure as it does on success, so without this check the code
+            // below would otherwise start auto-mobbing with this entry's bound wherever the
+            // player currently is instead of recognizing the attempt never got there. Skip this
+            // entry for the current run rather than mis-hunting or retrying forever.
+            info!(
+                target: "backend/rotator",
+                "Daily Quest: failed to navigate to {}, skipping for this run", entry.id
+            );
+            self.daily_quest_index += 1;
+            self.daily_quest_navigating = false;
+            self.auto_mob_task = None;
+            self.auto_mob_quadrant_consecutive_count = None;
+            self.daily_quest_progress_task = None;
+            self.daily_quest_progress = Vec::new();
+            self.daily_quest_complete_task = None;
+            self.daily_quest_complete_popup_detected = false;
+            return;
+        }
+
+        if let Update::Ok(progress) = update_detection_task(
+            resources,
+            DAILY_QUEST_PROGRESS_POLL_MILLIS,
+            &mut self.daily_quest_progress_task,
+            move |detector| Ok(detector.detect_daily_quest_progress_popup()),
+        ) {
+            debug!(
+                target: "backend/rotator",
+                "Daily Quest: detected progress {progress:?} for {} (kill_target {})",
+                entry.id, entry.kill_target
+            );
+            self.daily_quest_progress = progress;
+        }
+        let progress = self
+            .daily_quest_progress
+            .iter()
+            .copied()
+            .find(|&(_, target)| target == entry.kill_target);
+        let kill_count_reached = progress.is_some_and(|(current, target)| current >= target);
+
+        if !self.daily_quest_complete_popup_detected
+            && let Update::Ok(()) = update_detection_task(
+                resources,
+                DAILY_QUEST_COMPLETE_POLL_MILLIS,
+                &mut self.daily_quest_complete_task,
+                move |detector| {
+                    let popup = detector.detect_quest_complete_popup()?;
+                    let label_roi = Rect::new(
+                        popup.x,
+                        popup.y + popup.height,
+                        DAILY_QUEST_COMPLETE_LABEL_ROI_WIDTH,
+                        popup.height + DAILY_QUEST_COMPLETE_LABEL_ROI_PADDING,
+                    );
+                    detector.detect_world_map_label(label_roi, "[Daily Quest]")?;
+                    Ok(())
+                },
+            )
+        {
+            debug!(
+                target: "backend/rotator",
+                "Daily Quest: detected \"Quest complete!\" toast for {}", entry.id
+            );
+            self.daily_quest_complete_popup_detected = true;
+        }
+
+        if kill_count_reached || self.daily_quest_complete_popup_detected {
+            info!(
+                target: "backend/rotator",
+                "Daily Quest: completed {} (progress {progress:?}, toast seen {})",
+                entry.id, self.daily_quest_complete_popup_detected
+            );
+            resources
+                .character_updates
+                .mark_daily_quest_completed(self.daily_quest_character_id, entry.id);
+            self.daily_quest_index += 1;
+            self.daily_quest_navigating = false;
+            self.auto_mob_task = None;
+            self.auto_mob_quadrant_consecutive_count = None;
+            self.daily_quest_progress_task = None;
+            self.daily_quest_progress = Vec::new();
+            self.daily_quest_complete_task = None;
+            self.daily_quest_complete_popup_detected = false;
+            if self.daily_quest_index >= self.daily_quest_entries.len() {
+                if let Some(saved) = self.daily_quest_saved_pathing.take() {
+                    minimap_context.set_platforms(saved.platforms);
+                    player_context.config.auto_mob_platforms_pathing =
+                        saved.auto_mob_platforms_pathing;
+                    player_context
+                        .config
+                        .auto_mob_platforms_pathing_up_jump_only =
+                        saved.auto_mob_platforms_pathing_up_jump_only;
+                    player_context.config.auto_mob_use_key_when_pathing =
+                        saved.auto_mob_use_key_when_pathing;
+                    player_context
+                        .config
+                        .auto_mob_use_key_when_pathing_update_millis =
+                        saved.auto_mob_use_key_when_pathing_update_millis;
+                }
+                resources
+                    .notification
+                    .schedule_notification(NotificationKind::DailyQuestCompleted);
+                // There is no per-map navigation back to the character's actual farming map yet
+                // (unlike daily quest hunting grounds, those aren't fixed content - each is
+                // user-defined and would need its own recorded navigation, one per map the user
+                // wants to hunt at). Returning to town is a safe, always-reachable parking spot
+                // instead of continuing to auto-mob the last daily's hunting ground under the
+                // farming map's `RotatorMode`, which would run with the wrong bound entirely.
+                self.inject_action(PlayerAction::Panic(Panic { to: PanicTo::Town }));
+                // Halting (rather than resetting the queue and leaving it `Running`) stops the
+                // bot once there, matching what the manual "stop and go to town" button does -
+                // `rotate_action`'s halting branch still drains side-loaded actions like the one
+                // just injected above, so the walk to town still completes despite halting here
+                // immediately instead of waiting for arrival first.
+                resources.operation.state = OperationState::Halting;
+            }
+            return;
+        }
+
+        self.rotate_auto_mobbing(
+            resources,
+            player_context,
+            minimap_state,
+            self.daily_quest_mobbing_key,
+            entry.id.bound(),
+        );
     }
 
     fn rotate_auto_mobbing(
@@ -1134,7 +1536,11 @@ impl DefaultRotator {
             // a double jump" - past that, we're not plausibly on the portal's platform yet.
             let same_platform = (portal_center_x - pos.x).abs() < DOUBLE_JUMP_THRESHOLD
                 && (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD;
-            let target_y = if same_platform { pos.y } else { portal_center_y };
+            let target_y = if same_platform {
+                pos.y
+            } else {
+                portal_center_y
+            };
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
@@ -1369,6 +1775,11 @@ impl Rotator for DefaultRotator {
         self.normal_rotate_mode
     }
 
+    #[inline]
+    fn is_navigating_daily_quest(&self) -> bool {
+        self.daily_quest_navigating
+    }
+
     #[cfg_attr(test, concretize)]
     fn build_actions(&mut self, args: RotatorBuildArgs) {
         info!(target: "backend/rotator", "preparing actions {args:?}");
@@ -1392,6 +1803,9 @@ impl Rotator for DefaultRotator {
             enable_reset_normal_actions_on_erda,
             enable_using_generic_booster,
             enable_using_hexa_booster,
+            daily_quest_entries,
+            daily_quest_mobbing_key,
+            daily_quest_character_id,
         } = args;
         self.reset_queue();
         self.normal_actions.clear();
@@ -1399,6 +1813,11 @@ impl Rotator for DefaultRotator {
         self.character_level = character_level;
         self.normal_actions_reset_on_erda = enable_reset_normal_actions_on_erda;
         self.priority_actions.clear();
+        self.daily_quest_entries = daily_quest_entries;
+        self.daily_quest_mobbing_key = daily_quest_mobbing_key;
+        self.daily_quest_character_id = daily_quest_character_id;
+        self.daily_quest_saved_pathing = None;
+        self.daily_quest_index = 0;
 
         // Monster Park is a tight, timed sweep-then-portal loop across several maps - buffs,
         // boosters and Erda Shower off-cooldown actions are disruptive there (e.g. stopping to
@@ -1560,6 +1979,11 @@ impl Rotator for DefaultRotator {
         self.monster_park_enemies_task = None;
         self.monster_park_enemies.clear();
         self.monster_park_gate_attempts = 0;
+        self.daily_quest_navigating = false;
+        self.daily_quest_progress_task = None;
+        self.daily_quest_progress.clear();
+        self.daily_quest_complete_task = None;
+        self.daily_quest_complete_popup_detected = false;
     }
 
     #[inline]
@@ -1579,6 +2003,16 @@ impl Rotator for DefaultRotator {
 
         self.rotate_priority_actions(resources, world);
         self.rotate_priority_actions_queue(&mut world.player);
+
+        if self.daily_quest_index < self.daily_quest_entries.len() {
+            self.rotate_daily_quest(
+                resources,
+                &mut world.player.context,
+                &mut world.minimap.context,
+                world.minimap.state,
+            );
+            return;
+        }
 
         match self.normal_rotate_mode {
             RotatorMode::StartToEnd => self.rotate_start_to_end(&mut world.player.context),
@@ -1697,6 +2131,7 @@ fn priority_action(
         condition_kind: Some(condition),
         metadata: None,
         queue_to_front,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1752,6 +2187,7 @@ fn familiar_essence_replenish_priority_action(key: KeyKind) -> PriorityAction {
             wait_after_buffered: WaitAfterBuffered::None,
         })),
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1778,6 +2214,7 @@ fn familiars_swap_priority_action(swap: FamiliarsSwap, swap_check_millis: u64) -
         metadata: None,
         inner: RotatorAction::Single(PlayerAction::FamiliarsSwap(swap)),
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1815,6 +2252,7 @@ fn solve_rune_priority_action() -> PriorityAction {
         metadata: None,
         inner: RotatorAction::Single(PlayerAction::SolveRune),
         queue_to_front: true,
+        suppress_during_daily_quest: false,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1842,6 +2280,7 @@ fn solve_transparent_shape_priority_action() -> PriorityAction {
         metadata: None,
         inner: RotatorAction::Single(PlayerAction::SolveShape),
         queue_to_front: true,
+        suppress_during_daily_quest: false,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1869,6 +2308,7 @@ fn solve_violetta_priority_action() -> PriorityAction {
         metadata: None,
         inner: RotatorAction::Single(PlayerAction::SolveVioletta),
         queue_to_front: true,
+        suppress_during_daily_quest: false,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1955,6 +2395,7 @@ fn buff_priority_action(buff: BuffKind, key: KeyKind) -> PriorityAction {
         })),
         metadata: Some(ActionMetadata::Buff { kind: buff }),
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -1982,6 +2423,7 @@ fn panic_priority_action() -> PriorityAction {
         })),
         metadata: None,
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2004,6 +2446,7 @@ fn elite_boss_change_channel_priority_action() -> PriorityAction {
         })),
         metadata: None,
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2038,6 +2481,7 @@ fn elite_boss_use_key_priority_action(key: KeyKind) -> PriorityAction {
         })),
         metadata: None,
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2094,6 +2538,7 @@ fn use_booster_priority_action(kind: Booster) -> PriorityAction {
         inner: RotatorAction::Single(PlayerAction::UseBooster(UseBooster { kind })),
         metadata: Some(ActionMetadata::UseBooster),
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2148,6 +2593,7 @@ fn exchange_hexa_booster_priority_action(
         })),
         metadata: None,
         queue_to_front: true,
+        suppress_during_daily_quest: true,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2185,6 +2631,7 @@ fn unstuck_priority_action() -> PriorityAction {
         inner: RotatorAction::Single(PlayerAction::Unstuck),
         metadata: None,
         queue_to_front: true,
+        suppress_during_daily_quest: false,
         queue_info: PriorityActionQueueInfo::default(),
     }
 }
@@ -2377,6 +2824,9 @@ mod tests {
             enable_reset_normal_actions_on_erda: false,
             enable_using_generic_booster: false,
             enable_using_hexa_booster: false,
+            daily_quest_entries: vec![],
+            daily_quest_mobbing_key: MobbingKey::default(),
+            daily_quest_character_id: None,
         };
 
         rotator.build_actions(args);
@@ -2473,6 +2923,7 @@ mod tests {
                 inner: RotatorAction::Single(PlayerAction::SolveRune),
                 metadata: None,
                 queue_to_front: true,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2497,6 +2948,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2508,6 +2960,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2525,6 +2978,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: true,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2546,6 +3000,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: true,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2579,6 +3034,7 @@ mod tests {
                 }),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2598,6 +3054,7 @@ mod tests {
                 inner: RotatorAction::Single(PlayerAction::SolveRune),
                 metadata: None,
                 queue_to_front: true,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2676,6 +3133,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2716,6 +3174,7 @@ mod tests {
                 }),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );
@@ -2752,6 +3211,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo {
                     last_queued_time: Some(Instant::now()),
                     ..Default::default()
@@ -2767,6 +3227,7 @@ mod tests {
                 inner: RotatorAction::Single(NORMAL_ACTION.into()),
                 metadata: None,
                 queue_to_front: false,
+                suppress_during_daily_quest: false,
                 queue_info: PriorityActionQueueInfo::default(),
             },
         );

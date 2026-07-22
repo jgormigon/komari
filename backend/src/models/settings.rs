@@ -140,6 +140,8 @@ pub struct Notifications {
     pub notify_on_lie_detector_appear: bool,
     #[serde(default)]
     pub notify_on_run_timer_end: bool,
+    #[serde(default)]
+    pub notify_on_daily_quest_completed: bool,
 }
 
 #[derive(

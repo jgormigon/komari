@@ -350,6 +350,19 @@ fn SectionNotifications() -> Element {
                     },
                     checked: notifications().notify_on_run_timer_end,
                 }
+                SettingsCheckbox {
+                    label: "Daily quests completed",
+                    on_checked: move |notify_on_daily_quest_completed| {
+                        save_settings(Settings {
+                            notifications: Notifications {
+                                notify_on_daily_quest_completed,
+                                ..notifications.peek().clone()
+                            },
+                            ..settings.peek().clone()
+                        });
+                    },
+                    checked: notifications().notify_on_daily_quest_completed,
+                }
             }
         }
     }

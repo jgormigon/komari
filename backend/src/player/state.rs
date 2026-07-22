@@ -1,4 +1,4 @@
-use std::{collections::HashMap, range::Range};
+use std::{collections::HashMap, mem, range::Range};
 
 use anyhow::Result;
 use log::{debug, info};
@@ -235,6 +235,8 @@ pub struct PlayerConfiguration {
     pub to_town_key: Option<KeyKind>,
     /// The change channel key.
     pub change_channel_key: Option<KeyKind>,
+    /// The world map key, used to navigate to a daily quest hunting ground.
+    pub world_map_key: Option<KeyKind>,
     /// The potion key.
     pub potion_key: KeyKind,
     /// Uses potion when health is below a percentage.
@@ -274,6 +276,7 @@ impl Default for PlayerConfiguration {
             familiar_key: None,
             to_town_key: None,
             change_channel_key: None,
+            world_map_key: None,
             potion_key: KeyKind::A,
             use_potion_below_percent: None,
             update_health_millis: None,
@@ -426,6 +429,17 @@ pub struct PlayerContext {
 
     /// The number of times [`Player::FamiliarsSwapping`] failed.
     familiars_swap_failed_count: u32,
+
+    /// Whether the most recently completed [`Player::NavigatingToHuntingGround`] attempt failed
+    /// to actually reach its destination (e.g. world map key not configured, an expected UI
+    /// element not found on screen).
+    ///
+    /// Both a failed and a successful attempt clear [`Self::priority_action`] the same way once
+    /// done, so without this the rotator (see
+    /// [`crate::rotator::DefaultRotator::rotate_daily_quest`]) cannot tell the two apart and would
+    /// otherwise proceed to auto-mob using the target hunting ground's bound wherever the player
+    /// currently is - the wrong map - instead of recognizing the attempt never got there.
+    daily_quest_navigate_failed: bool,
 
     name: Option<String>,
     name_task: Option<Task<Result<String>>>,
@@ -708,6 +722,23 @@ impl PlayerContext {
     #[inline]
     pub(super) fn clear_familiars_swap_fail_count(&mut self) {
         self.familiars_swap_failed_count = 0;
+    }
+
+    /// Records that the most recently completed [`Player::NavigatingToHuntingGround`] attempt
+    /// failed to reach its destination.
+    #[inline]
+    pub(super) fn set_daily_quest_navigate_failed(&mut self) {
+        self.daily_quest_navigate_failed = true;
+    }
+
+    /// Returns whether the most recently completed [`Player::NavigatingToHuntingGround`] attempt
+    /// failed, and clears the flag.
+    ///
+    /// Takes rather than just reads so a stale failure from a past attempt is never mistaken for
+    /// the outcome of a later one.
+    #[inline]
+    pub fn take_daily_quest_navigate_failed(&mut self) -> bool {
+        mem::take(&mut self.daily_quest_navigate_failed)
     }
 
     /// Increments the rune validation fail count and sets [`PlayerState::rune_cash_shop`]

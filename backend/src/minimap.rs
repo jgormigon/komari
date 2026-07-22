@@ -75,7 +75,6 @@ pub struct MinimapContext {
 }
 
 impl MinimapContext {
-    #[cfg(test)]
     pub fn platforms(&self) -> &[Platform] {
         &self.platforms
     }

@@ -17,10 +17,12 @@ use tokio::{
 #[cfg(debug_assertions)]
 use crate::services::debug::DebugService;
 use crate::{
-    Localization, Settings,
+    Character, Localization, Settings,
     bridge::{Capture, DefaultInputReceiver, Input, InputMethod},
+    database::{query_characters, upsert_character},
     database_event_receiver,
     ecs::{Resources, World, WorldEvent},
+    models::{DailyQuestEntry, DailyQuestId},
     rotator::Rotator,
     services::{
         capture::{CaptureService, DefaultCaptureService},
@@ -237,8 +239,88 @@ impl Services {
             self.event_bus.emit(&mut context, event);
         }
 
+        self.persist_daily_quest_completions(resources);
+
         #[cfg(debug_assertions)]
         self.debug.poll(resources);
         self.mediator.broadcast_state(resources, world);
+    }
+
+    /// Persists daily quest completions marked by the tick loop through
+    /// [`crate::ecs::CharacterUpdates`] (see its docs), if any.
+    ///
+    /// Each completion is tagged with the id of the character the rotator was actually built for
+    /// (see [`crate::rotator::DefaultRotator::daily_quest_character_id`]), which can differ from
+    /// [`Self::character`]'s currently *selected* character - e.g. the user switched the selected
+    /// character in the UI while a previous character's daily quest run was still in flight.
+    /// Persisting blindly against whichever character happens to be selected at drain time would
+    /// mark the wrong character's entry as completed instead (and leave the character that
+    /// actually ran it looking incomplete after a restart).
+    fn persist_daily_quest_completions(&mut self, resources: &mut Resources) {
+        let completed = resources.character_updates.drain_completed_daily_quests();
+        if completed.is_empty() {
+            return;
+        }
+
+        let today = DailyQuestEntry::today();
+        let current_id = self
+            .character
+            .character()
+            .and_then(|character| character.id);
+        let mut by_character_id: HashMap<i64, Vec<DailyQuestId>> = HashMap::new();
+        for (character_id, id) in completed {
+            let Some(character_id) = character_id else {
+                continue;
+            };
+            by_character_id.entry(character_id).or_default().push(id);
+        }
+
+        for (character_id, ids) in by_character_id {
+            if Some(character_id) == current_id {
+                let Some(mut character) = self.character.character().cloned() else {
+                    continue;
+                };
+                apply_daily_quest_completions(&mut character, &ids, today);
+                match upsert_character(&mut character) {
+                    Ok(()) => self.character.update_character(Some(character)),
+                    Err(err) => {
+                        error!(target: "backend/services", "failed to persist daily quest completion {err}")
+                    }
+                }
+                continue;
+            }
+
+            // Not the currently selected character - update its saved record directly instead of
+            // going through `self.character`, which must keep reflecting whatever the UI actually
+            // has selected.
+            let characters = match query_characters() {
+                Ok(characters) => characters,
+                Err(err) => {
+                    error!(target: "backend/services", "failed to query characters to persist daily quest completion {err}");
+                    continue;
+                }
+            };
+            let Some(mut character) = characters
+                .into_iter()
+                .find(|character| character.id == Some(character_id))
+            else {
+                continue;
+            };
+            apply_daily_quest_completions(&mut character, &ids, today);
+            if let Err(err) = upsert_character(&mut character) {
+                error!(target: "backend/services", "failed to persist daily quest completion {err}");
+            }
+        }
+    }
+}
+
+/// Marks every entry in `character.daily_quests` matching an id in `ids` as completed `today`.
+fn apply_daily_quest_completions(character: &mut Character, ids: &[DailyQuestId], today: u64) {
+    for entry in character
+        .daily_quests
+        .iter_mut()
+        .filter(|entry| ids.contains(&entry.id))
+    {
+        entry.last_completed_day = Some(today);
     }
 }

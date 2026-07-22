@@ -139,6 +139,19 @@ pub fn SectionKeyBindings() -> Element {
                     },
                     value: character().familiar_menu_key,
                 }
+                CharactersKeyBindingConfigurationInput {
+                    label: "World map",
+                    optional: true,
+                    tooltip: "This key must be set to use the daily quest solver, to navigate to a hunting ground.",
+                    disabled: character().id.is_none(),
+                    on_value: move |world_map_key| {
+                        save_character(Character {
+                            world_map_key,
+                            ..character.peek().clone()
+                        });
+                    },
+                    value: character().world_map_key,
+                }
             }
         }
     }

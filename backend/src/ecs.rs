@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    mem,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(debug_assertions)]
 use opencv::{
@@ -11,8 +14,8 @@ use crate::services::Event;
 use crate::{Settings, bridge::MockInput, detect::MockDetector};
 use crate::{
     bridge::Input, buff::BuffEntities, detect::Detector, minimap::MinimapEntity,
-    notification::Notification, operation::Operation, player::PlayerEntity, rng::Rng,
-    skill::SkillEntities,
+    models::DailyQuestId, notification::Notification, operation::Operation, player::PlayerEntity,
+    rng::Rng, skill::SkillEntities,
 };
 #[cfg(debug_assertions)]
 use crate::{debug::save_rune_for_training, run::FPS, solvers::SolvedArrow, utils::DatasetDir};
@@ -74,6 +77,40 @@ impl Debug {
     }
 }
 
+/// A resource for the tick loop to request that a daily quest's completion be persisted.
+///
+/// The rotator (see `rotator::DefaultRotator::rotate_daily_quest`) only has access to
+/// [`Resources`], not [`crate::services::Services`]' `CharacterService`/database access, so it
+/// cannot persist a completion by itself. Instead it pushes here, and
+/// `Services::poll` drains this every tick (from a point that does have `CharacterService`
+/// access) to actually update and re-save the character. Mirrors [`Notification`]'s shape as the
+/// existing precedent for a [`Resources`] field usable directly from deep tick code.
+///
+/// Each entry carries the id of the character the rotator was actually built for (see
+/// [`crate::rotator::DefaultRotator::daily_quest_character_id`]) alongside the completed
+/// [`DailyQuestId`] - the currently *selected* character in `CharacterService` can differ from
+/// that (e.g. the user switched characters in the UI while a previous character's daily quest run
+/// was still in flight), and persisting against whichever character happens to be selected at
+/// drain time would silently mark the wrong character's entry as completed.
+#[derive(Debug, Default, Clone)]
+pub struct CharacterUpdates {
+    completed_daily_quests: Arc<Mutex<Vec<(Option<i64>, DailyQuestId)>>>,
+}
+
+impl CharacterUpdates {
+    pub fn mark_daily_quest_completed(&self, character_id: Option<i64>, id: DailyQuestId) {
+        self.completed_daily_quests
+            .lock()
+            .unwrap()
+            .push((character_id, id));
+    }
+
+    /// Takes and clears all completed daily quest ids marked since the last drain.
+    pub fn drain_completed_daily_quests(&self) -> Vec<(Option<i64>, DailyQuestId)> {
+        mem::take(&mut *self.completed_daily_quests.lock().unwrap())
+    }
+}
+
 /// A struct containing shared resources.
 ///
 /// TODO: Reduce field visibilities.
@@ -88,6 +125,8 @@ pub struct Resources {
     pub rng: Rng,
     /// A resource for sending notifications through web hook.
     pub notification: Notification,
+    /// A resource for requesting a daily quest completion be persisted.
+    pub character_updates: CharacterUpdates,
     /// A resource to detect game information.
     ///
     /// This is [`None`] when no frame as ever been captured.
@@ -111,6 +150,7 @@ impl Resources {
             input: Box::new(input.unwrap_or_default()),
             rng: Rng::new(rand::random(), rand::random()),
             notification: Notification::new(Rc::new(RefCell::new(Settings::default()))),
+            character_updates: CharacterUpdates::default(),
             detector: detector.map(|detector| Arc::new(detector) as Arc<dyn Detector>),
             operation: Operation {
                 config: OperationConfiguration {

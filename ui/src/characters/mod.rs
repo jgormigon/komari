@@ -934,9 +934,10 @@ fn CharactersNumberU32Input(
     on_value: Callback<u32>,
     #[props(default)] max_value: Option<u32>,
     #[props(default)] disabled: bool,
+    #[props(default)] tooltip: Option<String>,
 ) -> Element {
     rsx! {
-        Labeled { label,
+        Labeled { label, tooltip,
             PrimitiveIntegerInput {
                 value,
                 on_value,

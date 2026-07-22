@@ -54,6 +54,7 @@ impl CharacterService for DefaultCharacterService {
             player_context.config.to_town_key = character.to_town_key.map(|key| key.key.into());
             player_context.config.change_channel_key =
                 character.change_channel_key.map(|key| key.key.into());
+            player_context.config.world_map_key = character.world_map_key.map(|key| key.key.into());
             player_context.config.potion_key = character.potion_key.key.into();
             player_context.config.use_potion_below_percent =
                 match (character.potion_key.enabled, character.potion_mode) {
