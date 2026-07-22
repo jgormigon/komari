@@ -1060,8 +1060,11 @@ fn detect_minimap_world_map_button(grayscale: &impl ToInputArray) -> Result<Rect
 
 fn detect_quest_complete_popup(grayscale: &impl ToInputArray) -> Result<Rect> {
     static TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(include_bytes!(env!("QUEST_COMPLETE_TEMPLATE")), IMREAD_GRAYSCALE)
-            .unwrap()
+        imgcodecs::imdecode(
+            include_bytes!(env!("QUEST_COMPLETE_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
     });
 
     detect_template(grayscale, &*TEMPLATE, Point::default(), 0.75)
@@ -1125,8 +1128,11 @@ fn detect_daily_quest_progress_popup(
     const NUMBERS_ROI_VERTICAL_PADDING: i32 = 8;
 
     static LABEL_TEMPLATE: LazyLock<Mat> = LazyLock::new(|| {
-        imgcodecs::imdecode(include_bytes!(env!("REGION_MOB_LABEL_TEMPLATE")), IMREAD_GRAYSCALE)
-            .unwrap()
+        imgcodecs::imdecode(
+            include_bytes!(env!("REGION_MOB_LABEL_TEMPLATE")),
+            IMREAD_GRAYSCALE,
+        )
+        .unwrap()
     });
 
     let label_matches = detect_template_multiple(
@@ -1139,7 +1145,10 @@ fn detect_daily_quest_progress_popup(
     );
     debug!(target: "backend/daily_quest", "progress popup label matches {label_matches:?}");
 
-    let Ok(bgr_bounds) = bgr.size().map(|size| Rect::new(0, 0, size.width, size.height)) else {
+    let Ok(bgr_bounds) = bgr
+        .size()
+        .map(|size| Rect::new(0, 0, size.width, size.height))
+    else {
         return Vec::new();
     };
 
@@ -3826,7 +3835,10 @@ mod tests {
         let _ = log::set_logger(&LOGGER);
         log::set_max_level(log::LevelFilter::Debug);
 
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../raw_resources/kill_count_pop_up");
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../raw_resources/kill_count_pop_up"
+        );
         let mut entries = fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -3889,7 +3901,10 @@ mod tests {
         assert_eq!(parse_daily_quest_progress("no slash here 100"), None);
         // `/` fused into the target's leading digit (e.g. misread as `1`) instead of landing as
         // its own token - unrecoverable, but must not be misparsed as a real, larger `current`
-        assert_eq!(parse_daily_quest_progress("Hotel Arcus Region Mob 461 100"), None);
+        assert_eq!(
+            parse_daily_quest_progress("Hotel Arcus Region Mob 461 100"),
+            None
+        );
         // A `current` larger than `target` must be rejected outright even when the text parses
         // cleanly otherwise - a kill count can never exceed its own cap, so this can only be OCR
         // corruption

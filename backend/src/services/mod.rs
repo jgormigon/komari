@@ -263,7 +263,10 @@ impl Services {
         }
 
         let today = DailyQuestEntry::today();
-        let current_id = self.character.character().and_then(|character| character.id);
+        let current_id = self
+            .character
+            .character()
+            .and_then(|character| character.id);
         let mut by_character_id: HashMap<i64, Vec<DailyQuestId>> = HashMap::new();
         for (character_id, id) in completed {
             let Some(character_id) = character_id else {

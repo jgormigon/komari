@@ -884,9 +884,13 @@ impl DefaultRotator {
             let has_platforms = !platforms.is_empty();
             minimap_context.set_platforms(platforms.into_iter().map(Platform::from).collect());
             player_context.config.auto_mob_platforms_pathing = has_platforms;
-            player_context.config.auto_mob_platforms_pathing_up_jump_only = false;
+            player_context
+                .config
+                .auto_mob_platforms_pathing_up_jump_only = false;
             player_context.config.auto_mob_use_key_when_pathing = has_platforms;
-            player_context.config.auto_mob_use_key_when_pathing_update_millis =
+            player_context
+                .config
+                .auto_mob_use_key_when_pathing_update_millis =
                 DAILY_QUEST_AUTO_MOB_USE_KEY_UPDATE_MILLIS;
 
             let navigation = entry.id.navigation();
@@ -1010,11 +1014,15 @@ impl DefaultRotator {
                     minimap_context.set_platforms(saved.platforms);
                     player_context.config.auto_mob_platforms_pathing =
                         saved.auto_mob_platforms_pathing;
-                    player_context.config.auto_mob_platforms_pathing_up_jump_only =
+                    player_context
+                        .config
+                        .auto_mob_platforms_pathing_up_jump_only =
                         saved.auto_mob_platforms_pathing_up_jump_only;
                     player_context.config.auto_mob_use_key_when_pathing =
                         saved.auto_mob_use_key_when_pathing;
-                    player_context.config.auto_mob_use_key_when_pathing_update_millis =
+                    player_context
+                        .config
+                        .auto_mob_use_key_when_pathing_update_millis =
                         saved.auto_mob_use_key_when_pathing_update_millis;
                 }
                 resources
