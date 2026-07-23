@@ -28,6 +28,29 @@ pub const ADJUSTING_SHORT_THRESHOLD: i32 = 1;
 /// Minimum x distance from the destination required to walk.
 pub const ADJUSTING_MEDIUM_THRESHOLD: i32 = 3;
 
+/// Same role as [`ADJUSTING_MEDIUM_THRESHOLD`], but used instead of it whenever [`Moving::exact`]
+/// is true - the distance at which continuous-hold "medium adjust" walking gives way to bounded,
+/// tap-and-recheck "short adjust" movement.
+///
+/// Continuous-hold walking releases the direction key based on a position check made once per
+/// tick, but that release can only take effect starting the *next* tick - by which point the
+/// character has already moved through however far it travels in one tick's worth of continuous
+/// walking. If that per-tick distance exceeds how far `x_distance` still had left to close,
+/// continuous-hold walking necessarily overshoots the destination, sometimes bouncing back and
+/// forth a couple of times before finally landing inside `ADJUSTING_SHORT_THRESHOLD`'s range.
+/// `ADJUSTING_MEDIUM_THRESHOLD` (3px) is well inside that per-tick travel distance, so exact
+/// destinations were paying for this overshoot-then-correct dance on every approach. Switching to
+/// bounded, fixed-duration taps at a wider distance instead gives the approach room to decelerate
+/// before overshooting becomes physically possible within a single tick, rather than correcting
+/// for it afterward.
+///
+/// Only actually exercised by Monster Park's portal/gate movement today - `exact: true` is not
+/// currently set anywhere else in the codebase - so this can be tuned independently of
+/// `ADJUSTING_MEDIUM_THRESHOLD` without affecting any other movement. The value is an empirical
+/// starting point; adjust based on in-game observation if overshoot still happens (raise it) or
+/// the approach feels unnecessarily slow (lower it).
+const ADJUSTING_EXACT_SWITCH_THRESHOLD: i32 = 8;
+
 const ADJUSTING_SHORT_TIMEOUT: u32 = MOVE_TIMEOUT + 3;
 
 /// Number of short-adjust tap cycles to attempt reaching exact (0px) alignment before giving up
@@ -130,8 +153,14 @@ pub fn update_adjusting_state(
                     moving.timeout.current = moving.timeout.current.saturating_sub(1);
                 }
 
-                let should_adjust_medium =
-                    !adjusting_started && x_distance >= ADJUSTING_MEDIUM_THRESHOLD;
+                // Exact destinations switch to bounded tap correction earlier - see
+                // `ADJUSTING_EXACT_SWITCH_THRESHOLD`'s docs for why.
+                let medium_threshold = if moving.exact {
+                    ADJUSTING_EXACT_SWITCH_THRESHOLD
+                } else {
+                    ADJUSTING_MEDIUM_THRESHOLD
+                };
+                let should_adjust_medium = !adjusting_started && x_distance >= medium_threshold;
                 let should_adjust_short =
                     adjusting_started || (moving.exact && x_distance >= ADJUSTING_SHORT_THRESHOLD);
                 let direction = match x_direction.cmp(&0) {
@@ -339,6 +368,45 @@ mod tests {
         assert_eq!(
             player.context.last_known_direction,
             ActionKeyDirection::Left
+        );
+    }
+
+    #[test]
+    fn update_adjusting_state_updated_exact_uses_short_adjust_below_exact_switch_threshold() {
+        let mut keys = MockInput::default();
+        // Below `ADJUSTING_EXACT_SWITCH_THRESHOLD` (8) but at/above `ADJUSTING_MEDIUM_THRESHOLD`
+        // (3) - a non-exact move would still be continuous-hold walking here, but an exact one
+        // should already have switched to a bounded tap instead.
+        keys.expect_send_key_up().with(eq(KeyKind::Left)).once();
+        keys.expect_send_key_up().with(eq(KeyKind::Right)).once();
+        keys.expect_send_key_with_options()
+            .with(
+                eq(KeyKind::Right),
+                eq(InputKeyOptions::default().down_ms(80)),
+            )
+            .once();
+
+        let mut resources = Resources::new(Some(keys), None);
+
+        let pos = Point { x: 0, y: 0 };
+        let dest = Point { x: 5, y: 0 }; // x_distance = 5
+        let mut player = mock_player_entity(pos);
+        player.state = Player::Adjusting(Adjusting::new(
+            Moving::new(pos, dest, true, None).timeout_started(true),
+        ));
+
+        update_adjusting_state(&mut resources, &mut player, Minimap::Detecting);
+
+        assert_matches!(
+            player.state,
+            Player::Adjusting(Adjusting {
+                adjust_timeout: Timeout { started: true, .. },
+                ..
+            })
+        );
+        assert_eq!(
+            player.context.last_known_direction,
+            ActionKeyDirection::Right
         );
     }
 

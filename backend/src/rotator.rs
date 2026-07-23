@@ -33,9 +33,9 @@ use crate::{
     operation::OperationState,
     pathing::Platform,
     player::{
-        AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
-        GRAPPLING_THRESHOLD, Key, Move, NavigateToHuntingGround, Panic, PanicTo, PingPong,
-        PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant, UseBooster,
+        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Move,
+        NavigateToHuntingGround, Panic, PanicTo, PingPong, PingPongDirection, PlayerAction,
+        PlayerContext, PlayerEntity, Quadrant, UseBooster,
     },
     run::MS_PER_TICK,
     skill::{Skill, SkillKind},
@@ -363,6 +363,35 @@ pub struct DefaultRotator {
     /// rather than an actual portal-usage failure. Past [`MONSTER_PARK_PORTAL_ATTEMPT_LIMIT`],
     /// give up pressing Up and go back to re-scanning for enemies instead of retrying forever.
     monster_park_portal_attempts: u32,
+    /// Tracks the number of consecutive times [`Self::monster_park_portal_attempts`] has hit its
+    /// give-up limit without any genuine progress happening in between (a new enemy target
+    /// acquired, the player moving off the portal, or an actual map transition - all of which
+    /// reset this back to 0, same as [`Self::monster_park_portal_attempts`] itself).
+    ///
+    /// If giving up and re-scanning keeps leading right back to the same stuck-at-portal
+    /// situation, retrying that cycle forever isn't going to help - most likely something is
+    /// actually blocking the Up key from registering (e.g. a leftover dialog). Past
+    /// [`MONSTER_PARK_PORTAL_GIVE_UP_CYCLE_LIMIT`], escalate to the same recovery path used
+    /// elsewhere for a stuck player ([`PlayerAction::Unstuck`], which tries dismissing a blocking
+    /// dialog via Esc) instead of looping between "give up" and "immediately re-find the same
+    /// portal" indefinitely.
+    monster_park_portal_give_up_cycles: u32,
+    /// The `target_y` last computed for the portal-approach `Move` (see
+    /// [`DefaultRotator::rotate_monster_park`]'s `same_platform` logic), together with how many
+    /// consecutive times that Move has been reissued targeting that exact same height without
+    /// ever reaching the portal.
+    ///
+    /// `same_platform` freezes `target_y` to the player's current height instead of the portal's
+    /// real detected height, on the assumption the player is already on the right platform - if
+    /// that assumption is wrong (the position read when making the decision doesn't hold up once
+    /// `Player::Moving` re-evaluates a moment later, e.g. a double jump ends up firing after all),
+    /// the frozen height can be one the player physically can't reach, and re-deriving `target_y`
+    /// the same way on every retry reproduces the identical wrong value forever. Once the count
+    /// exceeds [`MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT`], `target_y` is forced to the portal's
+    /// real detected height instead, guaranteeing eventual convergence regardless of why the
+    /// frozen value was wrong. Reset to `(portal_center_y, 0)` whenever `target_y` actually changes
+    /// between reissues (genuine progress) and cleared by [`Self::reset_monster_park_run_state`].
+    monster_park_portal_target_y: Option<(i32, u32)>,
     /// The position of the enemy dot [`DefaultRotator::rotate_monster_park`] last targeted with
     /// [`PlayerAction::AutoMob`].
     ///
@@ -411,13 +440,22 @@ pub struct DefaultRotator {
     /// Left unchanged while a scan is still in flight or fails, so a single slow/failed scan
     /// doesn't blank out an otherwise-valid cache.
     monster_park_enemies: Vec<Point>,
+    /// The minimap `bbox` last seen by [`DefaultRotator::rotate_monster_park`], used to detect a
+    /// genuine stage transition (see the bbox comparison at the top of that function for the full
+    /// reasoning). `None` whenever no run is in progress - reset alongside everything else in
+    /// [`Self::reset_monster_park_run_state`].
+    monster_park_stage_bbox: Option<Rect>,
     /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park_entry`] has
-    /// pressed Up while standing at the entry gate without the dungeon-select dialog appearing.
+    /// attempted to hand off to [`PlayerAction::EnterMonsterPark`] from the gate without ever
+    /// actually leaving the entry lobby (e.g. no free entry left for the day, so the dungeon-select
+    /// dialog stays open / the Enter click does nothing).
     ///
-    /// Mirrors [`Self::monster_park_portal_attempts`]'s reasoning: past
-    /// [`MONSTER_PARK_GATE_ATTEMPT_LIMIT`], stop pressing Up and re-verify the player's position
-    /// instead of retrying forever.
-    monster_park_gate_attempts: u32,
+    /// Reset back to 0 as soon as a fresh, synchronous check confirms the player has genuinely
+    /// left the lobby (see the `RotatorMode::MonsterPark` dispatch in [`Self::rotate_action`]), so
+    /// this only ever measures a truly unbroken streak of failed attempts, not attempts spread
+    /// across otherwise-successful runs. Past [`MONSTER_PARK_ENTRY_ATTEMPT_LIMIT`], stop retrying
+    /// and halt instead of clicking through the same failing dialog for the rest of the session.
+    monster_park_entry_attempts: u32,
 
     /// Configured daily quest entries for [`Self::rotate_daily_quest`], from
     /// [`RotatorBuildArgs::daily_quest_entries`].
@@ -1208,6 +1246,29 @@ impl DefaultRotator {
             return;
         };
 
+        // A genuine stage transition (the common case) reliably changes the minimap's bbox - it
+        // requires a full anchor-mismatch -> re-detection cycle to get a new `MinimapIdle`, and
+        // `bbox` only ever comes from a fresh `detect_minimap()` call, never per-tick jitter within
+        // the same `Minimap::Idle` session (see `update_idle_state` in `minimap.rs`). Comparing it
+        // tick-to-tick is a direct, reliable "did the map actually change" signal - unlike relying
+        // solely on a new enemy being found soon to implicitly invalidate stale portal/enemy state
+        // (the original design for `monster_park_last_portal`), which can race: if the map starts
+        // with a brief window where enemies genuinely aren't detected yet, and the no-enemy
+        // debounce was already saturated from the previous stage's tail end, the very first tick(s)
+        // on the new stage can jump straight to "check portal" using the *previous* stage's now
+        // meaningless last-known portal position - sending the player to try to reach/climb to a
+        // spot that has nothing to do with this stage, exactly the kind of stuck-retrying-forever
+        // loop this is meant to prevent.
+        //
+        // Not fully bulletproof - consecutive stages can occasionally share similar enough minimap
+        // chrome that the anchor-mismatch check doesn't trip and `bbox` doesn't change (see
+        // `monster_park_portal_task`'s docs) - but it catches the common case instead of relying
+        // on the enemy-found fallback alone.
+        if self.monster_park_stage_bbox != Some(idle.bbox) {
+            self.reset_monster_park_run_state();
+            self.monster_park_stage_bbox = Some(idle.bbox);
+        }
+
         // Tolerance for matching a fresh detection back to a previously seen enemy dot, loose
         // enough to absorb detection jitter and the dot's own size (6x6) without being so loose it
         // matches a different, nearby enemy. Shared by both the still-pursuing-target check below
@@ -1351,6 +1412,8 @@ impl DefaultRotator {
 
             self.monster_park_last_portal = None;
             self.monster_park_portal_attempts = 0;
+            self.monster_park_portal_give_up_cycles = 0;
+            self.monster_park_portal_target_y = None;
             self.monster_park_target = Some(point);
             self.monster_park_target_missing_count = 0;
 
@@ -1504,6 +1567,10 @@ impl DefaultRotator {
             // occluding a still-alive enemy's dot) rather than the Up press itself failing. Give
             // up on the portal and re-scan for enemies instead of pressing Up forever.
             const MONSTER_PARK_PORTAL_ATTEMPT_LIMIT: u32 = 5;
+            // Past this many give-up-and-re-scan cycles in a row with no progress, re-scanning
+            // again isn't going to break the cycle by itself - escalate instead of repeating it
+            // forever. See `Self::monster_park_portal_give_up_cycles`'s docs.
+            const MONSTER_PARK_PORTAL_GIVE_UP_CYCLE_LIMIT: u32 = 3;
             if self.monster_park_portal_attempts >= MONSTER_PARK_PORTAL_ATTEMPT_LIMIT {
                 debug!(
                     target: "backend/rotator",
@@ -1511,8 +1578,32 @@ impl DefaultRotator {
                     self.monster_park_portal_attempts
                 );
                 self.monster_park_no_enemy_count = 0;
-                self.monster_park_last_portal = None;
+                // Deliberately NOT clearing `monster_park_last_portal` here. The player is
+                // standing on/near the portal right now - exactly the situation where their own
+                // minimap marker is most likely occluding the portal icon (see the field's docs).
+                // Clearing it would force the next attempt to depend on a fresh scan that's likely
+                // to keep failing for that same reason, and since nothing else re-establishes it
+                // while the player never moves off the portal, `last_portal` could stay `None`
+                // forever - permanently blocking the `let Some(portal) = ... else { return }` gate
+                // below on every future tick. That would make this whole retry/escalation path
+                // (including `monster_park_portal_give_up_cycles`'s `Unstuck` escalation) silently
+                // unreachable, leaving the player stuck in `Player::Idle` forever instead of
+                // retrying Up. Keeping the last known position lets `is_at_portal` keep evaluating
+                // true independent of whether a fresh scan succeeds, so retries actually continue.
                 self.monster_park_portal_attempts = 0;
+                self.monster_park_portal_target_y = None;
+                self.monster_park_portal_give_up_cycles += 1;
+                if self.monster_park_portal_give_up_cycles >= MONSTER_PARK_PORTAL_GIVE_UP_CYCLE_LIMIT
+                {
+                    info!(
+                        target: "backend/rotator",
+                        "Monster Park: stuck at the same portal for {} give-up cycles in a row, \
+                         trying to unstuck",
+                        self.monster_park_portal_give_up_cycles
+                    );
+                    self.monster_park_portal_give_up_cycles = 0;
+                    self.inject_action(PlayerAction::Unstuck);
+                }
                 return;
             }
             self.monster_park_portal_attempts += 1;
@@ -1542,6 +1633,7 @@ impl DefaultRotator {
             // Not at the portal (yet, or pushed off it), so the attempt streak from a previous
             // arrival no longer applies.
             self.monster_park_portal_attempts = 0;
+            self.monster_park_portal_give_up_cycles = 0;
 
             // Player is not at portal, move towards it. Only target the detected height when
             // it's far enough from the player's current height to plausibly be a real platform
@@ -1554,16 +1646,48 @@ impl DefaultRotator {
             // `PORTAL_Y_THRESHOLD` of the portal's height by coincidence. Freezing that transient
             // reading as the target then has the player climb back to it once they actually reach
             // the portal's platform and its real (different) height takes over, instead of just
-            // heading straight for the portal's real height from the start. Gate on the same
-            // horizontal distance Player::Moving itself uses to decide "close enough to not need
-            // a double jump" - past that, we're not plausibly on the portal's platform yet.
-            let same_platform = (portal_center_x - pos.x).abs() < DOUBLE_JUMP_THRESHOLD
+            // heading straight for the portal's real height from the start.
+            //
+            // Gated tightly (much tighter than `DOUBLE_JUMP_THRESHOLD`) rather than on "close
+            // enough that Player::Moving itself wouldn't need a double jump" as originally
+            // reasoned - live testing showed that boundary isn't actually safe: a double jump can
+            // still end up firing between this decision and `Player::Moving`'s own fresh
+            // recomputation a moment later (position drift across that gap), which invalidates
+            // the "already on this platform" assumption `target_y` relies on. Once that happens,
+            // the double jump (and whatever climb follows) can land short of the frozen target
+            // height, and the remaining small gap can fall into a range `Player::Jumping` can't
+            // reliably close, retrying indefinitely. Tightening this substantially shrinks that
+            // window; it doesn't eliminate it, hence the escape hatch below.
+            const SAME_PLATFORM_X_THRESHOLD: i32 = 3;
+            let same_platform = (portal_center_x - pos.x).abs() < SAME_PLATFORM_X_THRESHOLD
                 && (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD;
-            let target_y = if same_platform {
+            let mut target_y = if same_platform {
                 pos.y
             } else {
                 portal_center_y
             };
+
+            // Escape hatch: if the same (wrong) target_y keeps getting reissued without ever
+            // reaching the portal, re-deriving it the same way again isn't going to help - force
+            // the real detected height instead, guaranteeing convergence regardless of why the
+            // frozen value was wrong in the first place. See `monster_park_portal_target_y`'s docs.
+            const MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT: u32 = 3;
+            let repeats = match self.monster_park_portal_target_y {
+                Some((last_target_y, repeats)) if last_target_y == target_y => repeats + 1,
+                _ => 0,
+            };
+            if repeats >= MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT {
+                debug!(
+                    target: "backend/rotator",
+                    "Monster Park: target y {target_y} reissued {repeats} times without reaching \
+                     the portal, forcing real detected height {portal_center_y} instead"
+                );
+                target_y = portal_center_y;
+                self.monster_park_portal_target_y = None;
+            } else {
+                self.monster_park_portal_target_y = Some((target_y, repeats));
+            }
+
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
@@ -1583,9 +1707,24 @@ impl DefaultRotator {
 
     fn rotate_monster_park_entry(
         &mut self,
+        resources: &mut Resources,
         player_context: &mut PlayerContext,
         minimap_state: Minimap,
     ) {
+        // This is only ever called once the caller (`rotate_action`'s `RotatorMode::MonsterPark`
+        // dispatch) has freshly, synchronously confirmed the player is genuinely back in the
+        // entry lobby - i.e. the previous run (if any) has definitely ended. Reset the run-scoped
+        // Monster Park state right here rather than waiting until actually standing at the gate:
+        // a run's end and the next run's start happen without a rotator rebuild in between (same
+        // "MP" map config the whole time), so without resetting somewhere in between, the previous
+        // run's leftover state (last portal position, an already-saturated no-enemy counter) could
+        // be mistaken for this run's own progress once enemy scanning restarts. Resetting as soon
+        // as the lobby is confirmed - instead of only right before the gate hand-off - closes that
+        // gap immediately rather than relying on `rotate_monster_park`'s own early-return checks to
+        // stay safe for however long it takes to walk to the gate. Harmless to repeat on every
+        // call while still walking there (already-zeroed fields, cheap).
+        self.reset_monster_park_run_state();
+
         if player_context.has_normal_action() {
             return;
         }
@@ -1634,11 +1773,54 @@ impl DefaultRotator {
             return;
         }
 
+        // Past this many consecutive attempts that never actually leave the lobby, further
+        // retries aren't going to do anything different - most likely the day's free entries
+        // (Monster Park is capped per character per day) are used up, so the dungeon-select
+        // dialog staying open / the Enter click doing nothing will just keep repeating forever.
+        // Stop clicking through it and halt instead of busy-looping for the rest of the session.
+        const MONSTER_PARK_ENTRY_ATTEMPT_LIMIT: u32 = 3;
+        if self.monster_park_entry_attempts >= MONSTER_PARK_ENTRY_ATTEMPT_LIMIT {
+            info!(
+                target: "backend/rotator",
+                "Monster Park: entry failed {} times in a row (likely no free entries left today), halting",
+                self.monster_park_entry_attempts
+            );
+            resources.operation.state = OperationState::Halting;
+            return;
+        }
+        self.monster_park_entry_attempts += 1;
+
         // At the gate - hand off to `Player::EnteringMonsterPark`, which presses Up and drives
         // the whole dungeon-select dialog from here. This rotator's job stops at getting the
-        // player to the right spot.
+        // player to the right spot. Run state was already reset when this function was first
+        // entered (see the top of the function), so nothing further to clear here.
         player_context.set_priority_action(None, PlayerAction::EnterMonsterPark);
         debug!(target: "backend/rotator", "Monster Park Entry: at gate, entering Monster Park");
+    }
+
+    /// Resets the run-scoped Monster Park state tracked across [`Self::rotate_monster_park`]
+    /// ticks (enemy/portal caches and their debounce counters).
+    ///
+    /// Called on a full rotator rebuild ([`Self::reset_queue`]), as soon as the player is confirmed
+    /// back in the entry lobby ([`Self::rotate_monster_park_entry`]'s entry point), and on every
+    /// detected stage transition mid-run ([`Self::rotate_monster_park`]'s bbox comparison) - state
+    /// from whatever stage was previously active (last portal position, an already-saturated
+    /// no-enemy counter, cached enemy dots) is meaningless for a new stage/run and would otherwise
+    /// be mistaken for this one's own progress.
+    #[inline]
+    fn reset_monster_park_run_state(&mut self) {
+        self.monster_park_no_enemy_count = 0;
+        self.monster_park_portal_task = None;
+        self.monster_park_last_portal = None;
+        self.monster_park_portal_attempts = 0;
+        self.monster_park_portal_give_up_cycles = 0;
+        self.monster_park_portal_target_y = None;
+        self.monster_park_target = None;
+        self.monster_park_target_missing_count = 0;
+        self.monster_park_pending_target = None;
+        self.monster_park_enemies_task = None;
+        self.monster_park_enemies.clear();
+        self.monster_park_stage_bbox = None;
     }
 
     fn rotate_ping_pong(
@@ -1905,11 +2087,22 @@ impl Rotator for DefaultRotator {
             // infinite loop due to auto mobbing ignoring Any condition
             i += offset;
             match condition {
+                // Both conditions are skipped entirely during Monster Park - map-tied ones
+                // (`ErdaShowerOffCooldown`, and any `EveryMillis` action bound to a specific
+                // position) reference the user's regular farming map, which has nothing to do
+                // with whatever stage Monster Park currently has the player on, and periodic
+                // character-level ones (buffs/skills) are excluded the same way buffs already are
+                // above - Monster Park runs are short and fast-paced enough that maintaining them
+                // isn't worth interrupting mobbing/portal navigation for. Same reasoning applies
+                // for the whole mode session, not just while in the entry lobby, since there's no
+                // meaningful "farming map position" at any point during a Monster Park run.
                 ActionCondition::EveryMillis(_) => {
-                    self.priority_actions.insert(
-                        next_action_id(),
-                        priority_action(action, condition, queue_to_front),
-                    );
+                    if !is_monster_park {
+                        self.priority_actions.insert(
+                            next_action_id(),
+                            priority_action(action, condition, queue_to_front),
+                        );
+                    }
                 }
                 ActionCondition::ErdaShowerOffCooldown => {
                     if !is_monster_park {
@@ -1992,16 +2185,8 @@ impl Rotator for DefaultRotator {
         self.priority_queuing_linked_action = None;
         self.auto_mob_task = None;
         self.auto_mob_quadrant_consecutive_count = None;
-        self.monster_park_no_enemy_count = 0;
-        self.monster_park_portal_task = None;
-        self.monster_park_last_portal = None;
-        self.monster_park_portal_attempts = 0;
-        self.monster_park_target = None;
-        self.monster_park_target_missing_count = 0;
-        self.monster_park_pending_target = None;
-        self.monster_park_enemies_task = None;
-        self.monster_park_enemies.clear();
-        self.monster_park_gate_attempts = 0;
+        self.reset_monster_park_run_state();
+        self.monster_park_entry_attempts = 0;
         self.daily_quest_navigating = false;
         self.daily_quest_arrived = false;
         self.daily_quest_progress_task = None;
@@ -2029,13 +2214,28 @@ impl Rotator for DefaultRotator {
         self.rotate_priority_actions_queue(&mut world.player);
 
         if self.daily_quest_index < self.daily_quest_entries.len() {
-            self.rotate_daily_quest(
-                resources,
-                &mut world.player.context,
-                &mut world.minimap.context,
-                world.minimap.state,
-            );
-            return;
+            // Opening the world map to navigate to a hunting ground isn't possible while standing
+            // in Monster Park's entry lobby - the game doesn't allow it there. If daily quests are
+            // still pending but navigation to the current entry hasn't started yet (so this would
+            // be the point `rotate_daily_quest` tries to open the world map) and the player happens
+            // to be in the lobby (e.g. between Monster Park runs, if that's also the configured
+            // normal mode), fall through to the normal mode dispatch instead so it can move the
+            // player out of the lobby first - daily quest navigation resumes normally once no
+            // longer there. Only checked when nothing is already in flight, same reasoning as the
+            // `RotatorMode::MonsterPark` dispatch below for why that's the only time this matters.
+            let blocked_by_monster_park_entry = !self.daily_quest_navigating
+                && !world.player.context.has_normal_action()
+                && !world.player.context.has_priority_action()
+                && resources.detector().detect_monster_park_entry_map();
+            if !blocked_by_monster_park_entry {
+                self.rotate_daily_quest(
+                    resources,
+                    &mut world.player.context,
+                    &mut world.minimap.context,
+                    world.minimap.state,
+                );
+                return;
+            }
         }
 
         match self.normal_rotate_mode {
@@ -2054,9 +2254,36 @@ impl Rotator for DefaultRotator {
                 self.rotate_ping_pong(&mut world.player.context, world.minimap.state, key, bound)
             }
             RotatorMode::MonsterPark(key, bound) => {
-                if resources.detector().detect_monster_park_entry_map() {
-                    self.rotate_monster_park_entry(&mut world.player.context, world.minimap.state)
+                // `detect_monster_park_entry_map` is a synchronous, full-frame template match -
+                // non-trivial cost, unlike the small-ROI minimap scans inside a run that were
+                // already moved to a background task (see `monster_park_enemies_task`'s docs for
+                // why that mattered: a synchronous detector call stretching out a tick was found
+                // to break tight-timing movement). It only needs to be checked when actually
+                // deciding what to do next - while either function has an action in flight, both
+                // already no-op immediately once they see it (`rotate_monster_park_entry` on
+                // `has_normal_action`/`has_priority_action`, `rotate_monster_park` on the same
+                // checks once its own state - `monster_park_target` - rules out that action being
+                // its own), so which of the two gets called doesn't change behavior. Skipping the
+                // check and falling through to `rotate_monster_park` (whose only unconditional
+                // work is polling the already-async enemy scan) avoids paying for it on every tick
+                // an action is already running, which is most of them.
+                let has_action = world.player.context.has_normal_action()
+                    || world.player.context.has_priority_action();
+                if !has_action && resources.detector().detect_monster_park_entry_map() {
+                    self.rotate_monster_park_entry(
+                        resources,
+                        &mut world.player.context,
+                        world.minimap.state,
+                    )
                 } else {
+                    if !has_action {
+                        // A fresh, synchronous check (not skipped for having an action in flight)
+                        // just confirmed we're genuinely past the lobby - drop the entry retry
+                        // streak now that this attempt cycle is truly behind us, so a transient
+                        // hiccup on some earlier run doesn't count towards a later, unrelated
+                        // failure streak.
+                        self.monster_park_entry_attempts = 0;
+                    }
                     self.rotate_monster_park(
                         resources,
                         &mut world.player.context,
@@ -2856,6 +3083,59 @@ mod tests {
         rotator.build_actions(args);
         assert_eq!(rotator.priority_actions.len(), 11);
         assert_eq!(rotator.normal_actions.len(), 2);
+    }
+
+    #[test]
+    fn rotator_build_actions_monster_park_excludes_fixed_actions() {
+        const EVERY_MILLIS_ACTION: Action = Action::Move(ActionMove {
+            position: Position {
+                x: 0,
+                x_random_range: 0,
+                y: 0,
+                allow_adjusting: false,
+            },
+            condition: ActionCondition::EveryMillis(1000),
+            wait_after_move_millis: 0,
+        });
+
+        let mut rotator = DefaultRotator::default();
+        let args = RotatorBuildArgs {
+            mode: RotatorMode::MonsterPark(MobbingKey::default(), Bound::default()),
+            character_level: 1,
+            map_actions: vec![EVERY_MILLIS_ACTION, PRIORITY_ACTION],
+            character_actions: vec![EVERY_MILLIS_ACTION],
+            buffs: vec![(BuffKind::Rune, KeyKind::A); 4],
+            familiars: Familiars::default(),
+            familiar_essence_key: KeyKind::A,
+            elite_boss_behavior: EliteBossBehavior::None,
+            elite_boss_behavior_key: KeyKind::A,
+            hexa_booster_exchange_condition: ExchangeHexaBoosterCondition::None,
+            hexa_booster_exchange_amount: 1,
+            hexa_booster_exchange_all: false,
+            enable_panic_mode: false,
+            enable_rune_solving: false,
+            enable_transparent_shape_solving: false,
+            enable_violetta_solving: false,
+            enable_reset_normal_actions_on_erda: false,
+            enable_using_generic_booster: false,
+            enable_using_hexa_booster: false,
+            daily_quest_entries: vec![],
+            daily_quest_mobbing_key: MobbingKey::default(),
+            daily_quest_character_id: None,
+        };
+
+        rotator.build_actions(args);
+
+        // Neither the map-level nor the character-level EveryMillis action, nor the
+        // ErdaShowerOffCooldown one, should have been registered - only the always-present
+        // unstuck priority action remains.
+        assert_eq!(rotator.priority_actions.len(), 1);
+        assert!(
+            rotator
+                .priority_actions
+                .values()
+                .all(|action| action.condition_kind.is_none())
+        );
     }
 
     #[test]

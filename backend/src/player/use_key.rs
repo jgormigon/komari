@@ -184,6 +184,23 @@ impl UseKey {
         }
     }
 
+    /// Keys this state may currently be holding down (`send_key_down` without a matching
+    /// `send_key_up` yet) - the main key, if `key_hold_ticks > 0` and mid-hold, and the link key,
+    /// if `link_key` is [`LinkKeyKind::Along`] and mid-hold.
+    ///
+    /// Used to release anything still held when this state is discarded outside its own normal
+    /// completion path (see [`super::release_keys_held_by`]) - not gated on whether a hold is
+    /// actually in progress right now, since releasing an already-released key is a harmless
+    /// no-op at the input layer, and that's simpler and safer than tracking the exact internal
+    /// timing here too.
+    pub(crate) fn held_keys(&self) -> impl Iterator<Item = KeyKind> + use<> {
+        let link = match self.link_key {
+            LinkKeyKind::Along(key) => Some(key),
+            _ => None,
+        };
+        std::iter::once(self.key).chain(link)
+    }
+
     fn is_last_key_use(&self) -> bool {
         self.current_count >= self.count - 1
     }
