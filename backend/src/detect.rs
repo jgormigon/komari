@@ -647,19 +647,34 @@ impl Detector for DefaultDetector {
     }
 
     fn detect_transparent_shapes(&self, region: Rect) -> Vec<(Rect, f32)> {
-        detect_transparent_shapes(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_transparent_shapes(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_mushrooms(&self, region: Rect) -> Vec<(Rect, f32)> {
-        detect_violetta_mushrooms(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_violetta_mushrooms(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_face(&self, region: Rect) -> Result<Rect> {
-        detect_violetta_face(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let region = clamp_rect_to_mat(bgr, region)
+            .ok_or_else(|| anyhow!("region is outside of the captured frame"))?;
+        detect_violetta_face(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect> {
-        detect_violetta_numbers(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_violetta_numbers(&bgr.roi(region).unwrap())
     }
 
     fn detect_world_map_title(&self) -> Result<Rect> {
@@ -681,6 +696,17 @@ impl Detector for DefaultDetector {
     fn detect_quest_complete_popup(&self) -> Result<Rect> {
         detect_quest_complete_popup(self.grayscale())
     }
+}
+
+/// Intersects `region` with `mat`'s bounds, returning `None` if the two don't overlap at all.
+///
+/// `region` is sometimes derived from a detected point plus a fixed offset (e.g. the lie
+/// detector's puzzle area), so it can end up partially or fully outside the actual captured
+/// frame - passing such a `region` straight to [`MatTraitConst::roi`] panics instead of erroring.
+fn clamp_rect_to_mat(mat: &impl MatTraitConst, region: Rect) -> Option<Rect> {
+    let bounds = Rect::new(0, 0, mat.cols(), mat.rows());
+    let clamped = region & bounds;
+    (clamped.width > 0 && clamped.height > 0).then_some(clamped)
 }
 
 fn detect_mobs(
@@ -3912,5 +3938,34 @@ mod tests {
             parse_daily_quest_progress("Cernium Region Mob 150 / 100"),
             None
         );
+    }
+
+    #[test]
+    fn clamp_rect_to_mat_intersects_bounds() {
+        use opencv::core::{CV_8UC3, Mat, Rect, Scalar};
+
+        use super::clamp_rect_to_mat;
+
+        let mat = Mat::new_rows_cols_with_default(200, 300, CV_8UC3, Scalar::all(0.0)).unwrap();
+
+        // Fully inside - unchanged
+        assert_eq!(
+            clamp_rect_to_mat(&mat, Rect::new(10, 10, 50, 50)),
+            Some(Rect::new(10, 10, 50, 50))
+        );
+
+        // Partially outside - clamped down to just the overlapping area
+        assert_eq!(
+            clamp_rect_to_mat(&mat, Rect::new(280, 180, 100, 100)),
+            Some(Rect::new(280, 180, 20, 20))
+        );
+
+        // Fully outside - no overlap at all
+        assert_eq!(clamp_rect_to_mat(&mat, Rect::new(400, 400, 50, 50)), None);
+
+        // Same shape as the real crash this guards against: a lie detector puzzle region (title
+        // position + fixed 755x505 offset) that overshoots a frame this small on both axes -
+        // `.roi()` would otherwise panic instead of this returning `None`.
+        assert_eq!(clamp_rect_to_mat(&mat, Rect::new(905, 377, 755, 505)), None);
     }
 }

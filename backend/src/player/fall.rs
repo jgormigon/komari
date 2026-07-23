@@ -188,10 +188,8 @@ fn update_from_action(
                 player,
                 minimap_state,
                 mob,
-                x_distance,
-                x_direction,
-                y_distance,
-                y_direction,
+                (x_distance, x_direction),
+                (y_distance, y_direction),
             )
         }
 

@@ -370,10 +370,8 @@ pub(super) fn update_from_auto_mob_action(
     player: &mut PlayerEntity,
     minimap_state: Minimap,
     mob: AutoMob,
-    x_distance: i32,
-    x_direction: i32,
-    y_distance: i32,
-    y_direction: i32,
+    (x_distance, x_direction): (i32, i32),
+    (y_distance, y_direction): (i32, i32),
 ) {
     let y_threshold = if mob.is_monster_park && y_direction < 0 {
         MONSTER_PARK_USE_KEY_Y_BELOW_THRESHOLD
