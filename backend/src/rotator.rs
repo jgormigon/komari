@@ -291,6 +291,10 @@ pub trait Rotator: Debug + 'static {
     fn rotate_action(&mut self, resources: &mut Resources, world: &mut World);
 }
 
+/// A daily quest's kill-count progress, as `(current, target)`, from
+/// [`crate::detect::Detector::detect_daily_quest_progress_popup`].
+type DailyQuestProgress = (u32, u32);
+
 /// Snapshot of platform-pathing state overwritten while a daily quest run is applying its own
 /// hunting ground's platforms - see [`DefaultRotator::daily_quest_saved_pathing`].
 #[derive(Clone, Debug)]
@@ -467,12 +471,12 @@ pub struct DefaultRotator {
     /// long as mobbing continued, stalling everything else (movement, mob detection, minimap
     /// re-detection) right along with it, back when every poll paid that cost unconditionally.
     /// Same reasoning as [`Self::monster_park_portal_task`].
-    daily_quest_progress_task: Option<Task<Result<Vec<(u32, u32)>>>>,
+    daily_quest_progress_task: Option<Task<Result<Vec<DailyQuestProgress>>>>,
     /// Last progress scan result from [`Self::daily_quest_progress_task`].
     ///
     /// Left unchanged while a scan is still in flight or fails, same reasoning as
     /// [`Self::monster_park_enemies`].
-    daily_quest_progress: Vec<(u32, u32)>,
+    daily_quest_progress: Vec<DailyQuestProgress>,
     /// Background task scanning for the "Quest complete!" toast confirmed as a daily quest (see
     /// [`Self::rotate_daily_quest`]), same reasoning as [`Self::daily_quest_progress_task`].
     daily_quest_complete_task: Option<Task<Result<()>>>,

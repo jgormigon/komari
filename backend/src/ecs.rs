@@ -92,9 +92,12 @@ impl Debug {
 /// that (e.g. the user switched characters in the UI while a previous character's daily quest run
 /// was still in flight), and persisting against whichever character happens to be selected at
 /// drain time would silently mark the wrong character's entry as completed.
+/// A completed daily quest, paired with the id of the character it was completed for.
+type CompletedDailyQuest = (Option<i64>, DailyQuestId);
+
 #[derive(Debug, Default, Clone)]
 pub struct CharacterUpdates {
-    completed_daily_quests: Arc<Mutex<Vec<(Option<i64>, DailyQuestId)>>>,
+    completed_daily_quests: Arc<Mutex<Vec<CompletedDailyQuest>>>,
 }
 
 impl CharacterUpdates {
@@ -106,7 +109,7 @@ impl CharacterUpdates {
     }
 
     /// Takes and clears all completed daily quest ids marked since the last drain.
-    pub fn drain_completed_daily_quests(&self) -> Vec<(Option<i64>, DailyQuestId)> {
+    pub fn drain_completed_daily_quests(&self) -> Vec<CompletedDailyQuest> {
         mem::take(&mut *self.completed_daily_quests.lock().unwrap())
     }
 }

@@ -136,10 +136,8 @@ pub fn update_grappling_state(
                         player,
                         minimap_state,
                         mob,
-                        x_distance,
-                        x_direction,
-                        y_distance,
-                        y_direction,
+                        (x_distance, x_direction),
+                        (y_distance, y_direction),
                     )
                 }
                 Some(PlayerAction::PingPong(ping_pong)) => {

@@ -3939,4 +3939,36 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn clamp_rect_to_mat_intersects_bounds() {
+        use opencv::core::{CV_8UC3, Mat, Rect, Scalar};
+
+        use super::clamp_rect_to_mat;
+
+        let mat = Mat::new_rows_cols_with_default(200, 300, CV_8UC3, Scalar::all(0.0)).unwrap();
+
+        // Fully inside - unchanged
+        assert_eq!(
+            clamp_rect_to_mat(&mat, Rect::new(10, 10, 50, 50)),
+            Some(Rect::new(10, 10, 50, 50))
+        );
+
+        // Partially outside - clamped down to just the overlapping area
+        assert_eq!(
+            clamp_rect_to_mat(&mat, Rect::new(280, 180, 100, 100)),
+            Some(Rect::new(280, 180, 20, 20))
+        );
+
+        // Fully outside - no overlap at all
+        assert_eq!(clamp_rect_to_mat(&mat, Rect::new(400, 400, 50, 50)), None);
+
+        // Same shape as the real crash this guards against: a lie detector puzzle region (title
+        // position + fixed 755x505 offset) that overshoots a frame this small on both axes -
+        // `.roi()` would otherwise panic instead of this returning `None`.
+        assert_eq!(
+            clamp_rect_to_mat(&mat, Rect::new(905, 377, 755, 505)),
+            None
+        );
+    }
 }

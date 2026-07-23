@@ -292,10 +292,8 @@ fn update_from_action(
                 player,
                 minimap_state,
                 mob,
-                x_distance,
-                x_direction,
-                y_distance,
-                y_direction,
+                (x_distance, x_direction),
+                (y_distance, y_direction),
             )
         }
 
@@ -659,7 +657,11 @@ mod tests {
     fn update_up_jumping_state_updated_before_second_press_delay_no_keys_sent() {
         let mut moving = Moving::new(Point::new(0, 0), Point::new(0, 20), true, None);
         moving.timeout.started = true;
-        moving.timeout.total = SECOND_PRESS_DELAY - 1; // before threshold
+        // `next_moving_lifecycle_with_axis` increments `total` by 1 before `update_up_jump` reads
+        // it (the position doesn't change tick over tick here, so `current` isn't reset and this
+        // is a plain `Updated` lifecycle) - preset two below the threshold so it lands one below
+        // after that increment, genuinely testing "before threshold" instead of landing on it.
+        moving.timeout.total = SECOND_PRESS_DELAY.saturating_sub(2); // before threshold
         let mut player = setup_player(UpJumping {
             moving,
             kind: UpJumpingKind::JumpKey,
