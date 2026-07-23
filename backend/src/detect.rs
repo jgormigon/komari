@@ -3634,23 +3634,33 @@ fn preprocess_for_text(bgr: &impl MatTraitConst) -> Mat {
 
 /// Expands `bbox` in all the direction by `count` pixel(s) and clamps to `size` if provided.
 #[inline]
+/// Expands `bbox` by `count` pixels on every side, optionally clamped to stay inside `size`.
+///
+/// The margin actually applied on one axis is the *same* on both sides - whichever side has less
+/// room within `size` - rather than clamping each side independently. Clamping independently would
+/// let a box near one edge expand fully on the far side while getting clipped on the near side,
+/// silently shifting the box's center away from the edge instead of just shrinking the margin.
+/// For a detected portal near the edge of the minimap, that shifted center then becomes the
+/// player's movement target and "have I arrived" check alike - both self-consistent, but both
+/// wrong relative to the portal's actual in-game position, so the player can stand exactly on the
+/// computed (wrong) point, be told it has arrived, and have Up do nothing, forever.
 fn expand_bbox(size: Option<Size>, bbox: Rect, count: i32) -> Rect {
-    let mut x1 = bbox.x - count;
-    let mut y1 = bbox.y - count;
-    if size.is_some() {
-        x1 = x1.max(0);
-        y1 = y1.max(0);
-    }
-
     let br = bbox.br();
-    let mut x2 = br.x + count;
-    let mut y2 = br.y + count;
-    if let Some(size) = size {
-        x2 = x2.min(size.width);
-        y2 = y2.min(size.height);
-    }
+    let (x1, x2) = symmetric_expand(bbox.x, br.x, count, size.map(|size| size.width));
+    let (y1, y2) = symmetric_expand(bbox.y, br.y, count, size.map(|size| size.height));
 
     Rect::new(x1, y1, x2 - x1, y2 - y1)
+}
+
+/// Expands the `[lo, hi]` range by `count` on both ends, clamped to `[0, bound]` if given - using
+/// whichever side has less room as the margin for *both* sides, to keep the range's center fixed.
+#[inline]
+fn symmetric_expand(lo: i32, hi: i32, count: i32, bound: Option<i32>) -> (i32, i32) {
+    let margin = match bound {
+        Some(bound) => count.min(lo).min(bound - hi).max(0),
+        None => count,
+    };
+    (lo - margin, hi + margin)
 }
 
 /// Computes the intersection over union ratio.
@@ -3806,7 +3816,45 @@ fn build_session(model: &[u8]) -> Result<Session> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_daily_quest_progress;
+    use opencv::core::{Rect, Size};
+
+    use super::{expand_bbox, parse_daily_quest_progress};
+
+    #[test]
+    fn expand_bbox_interior_expands_symmetrically() {
+        let bbox = Rect::new(50, 50, 10, 10);
+        let expanded = expand_bbox(Some(Size::new(200, 200)), bbox, 5);
+
+        assert_eq!(expanded, Rect::new(45, 45, 20, 20));
+        // Center stays exactly the same as the original box.
+        assert_eq!(expanded.x + expanded.width / 2, bbox.x + bbox.width / 2);
+        assert_eq!(expanded.y + expanded.height / 2, bbox.y + bbox.height / 2);
+    }
+
+    #[test]
+    fn expand_bbox_near_right_edge_shrinks_margin_on_both_sides() {
+        // Only 2px of room to the right of the box within a 100-wide minimap.
+        let bbox = Rect::new(90, 50, 8, 10);
+        let expanded = expand_bbox(Some(Size::new(100, 200)), bbox, 5);
+
+        // Both sides use the smaller (2px) margin instead of the right side clipping to 2px
+        // while the left side still gets the full 5px - which would shift the center left.
+        assert_eq!(expanded, Rect::new(88, 45, 12, 20));
+        let orig_center_x = bbox.x + bbox.width / 2;
+        let expanded_center_x = expanded.x + expanded.width / 2;
+        assert_eq!(
+            expanded_center_x, orig_center_x,
+            "expanded box center must not shift away from the edge"
+        );
+    }
+
+    #[test]
+    fn expand_bbox_without_size_always_expands_fully() {
+        let bbox = Rect::new(0, 0, 10, 10);
+        let expanded = expand_bbox(None, bbox, 5);
+
+        assert_eq!(expanded, Rect::new(-5, -5, 20, 20));
+    }
 
     struct StdoutLogger;
 
