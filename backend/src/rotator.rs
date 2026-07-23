@@ -418,6 +418,11 @@ pub struct DefaultRotator {
     /// Left unchanged while a scan is still in flight or fails, so a single slow/failed scan
     /// doesn't blank out an otherwise-valid cache.
     monster_park_enemies: Vec<Point>,
+    /// The minimap `bbox` last seen by [`DefaultRotator::rotate_monster_park`], used to detect a
+    /// genuine stage transition (see the bbox comparison at the top of that function for the full
+    /// reasoning). `None` whenever no run is in progress - reset alongside everything else in
+    /// [`Self::reset_monster_park_run_state`].
+    monster_park_stage_bbox: Option<Rect>,
     /// Tracks the number of consecutive times [`DefaultRotator::rotate_monster_park_entry`] has
     /// attempted to hand off to [`PlayerAction::EnterMonsterPark`] from the gate without ever
     /// actually leaving the entry lobby (e.g. no free entry left for the day, so the dungeon-select
@@ -1202,6 +1207,29 @@ impl DefaultRotator {
             return;
         };
 
+        // A genuine stage transition (the common case) reliably changes the minimap's bbox - it
+        // requires a full anchor-mismatch -> re-detection cycle to get a new `MinimapIdle`, and
+        // `bbox` only ever comes from a fresh `detect_minimap()` call, never per-tick jitter within
+        // the same `Minimap::Idle` session (see `update_idle_state` in `minimap.rs`). Comparing it
+        // tick-to-tick is a direct, reliable "did the map actually change" signal - unlike relying
+        // solely on a new enemy being found soon to implicitly invalidate stale portal/enemy state
+        // (the original design for `monster_park_last_portal`), which can race: if the map starts
+        // with a brief window where enemies genuinely aren't detected yet, and the no-enemy
+        // debounce was already saturated from the previous stage's tail end, the very first tick(s)
+        // on the new stage can jump straight to "check portal" using the *previous* stage's now
+        // meaningless last-known portal position - sending the player to try to reach/climb to a
+        // spot that has nothing to do with this stage, exactly the kind of stuck-retrying-forever
+        // loop this is meant to prevent.
+        //
+        // Not fully bulletproof - consecutive stages can occasionally share similar enough minimap
+        // chrome that the anchor-mismatch check doesn't trip and `bbox` doesn't change (see
+        // `monster_park_portal_task`'s docs) - but it catches the common case instead of relying
+        // on the enemy-found fallback alone.
+        if self.monster_park_stage_bbox != Some(idle.bbox) {
+            self.reset_monster_park_run_state();
+            self.monster_park_stage_bbox = Some(idle.bbox);
+        }
+
         // Tolerance for matching a fresh detection back to a previously seen enemy dot, loose
         // enough to absorb detection jitter and the dot's own size (6x6) without being so loose it
         // matches a different, nearby enemy. Shared by both the still-pursuing-target check below
@@ -1700,12 +1728,12 @@ impl DefaultRotator {
     /// Resets the run-scoped Monster Park state tracked across [`Self::rotate_monster_park`]
     /// ticks (enemy/portal caches and their debounce counters).
     ///
-    /// Called both on a full rotator rebuild ([`Self::reset_queue`]) and as soon as the player is
-    /// confirmed back in the entry lobby ([`Self::rotate_monster_park_entry`]'s entry point) - a
-    /// run's end and the next run's start happen without a rebuild in between (same "MP" map
-    /// config the whole time), so without this second call site, state left over from the previous
-    /// run (e.g. the last stage's portal position, an already-saturated no-enemy counter) would
-    /// otherwise carry into the new run and be mistaken for this run's own progress.
+    /// Called on a full rotator rebuild ([`Self::reset_queue`]), as soon as the player is confirmed
+    /// back in the entry lobby ([`Self::rotate_monster_park_entry`]'s entry point), and on every
+    /// detected stage transition mid-run ([`Self::rotate_monster_park`]'s bbox comparison) - state
+    /// from whatever stage was previously active (last portal position, an already-saturated
+    /// no-enemy counter, cached enemy dots) is meaningless for a new stage/run and would otherwise
+    /// be mistaken for this one's own progress.
     #[inline]
     fn reset_monster_park_run_state(&mut self) {
         self.monster_park_no_enemy_count = 0;
@@ -1718,6 +1746,7 @@ impl DefaultRotator {
         self.monster_park_pending_target = None;
         self.monster_park_enemies_task = None;
         self.monster_park_enemies.clear();
+        self.monster_park_stage_bbox = None;
     }
 
     fn rotate_ping_pong(
