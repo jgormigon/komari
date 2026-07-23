@@ -3966,9 +3966,6 @@ mod tests {
         // Same shape as the real crash this guards against: a lie detector puzzle region (title
         // position + fixed 755x505 offset) that overshoots a frame this small on both axes -
         // `.roi()` would otherwise panic instead of this returning `None`.
-        assert_eq!(
-            clamp_rect_to_mat(&mat, Rect::new(905, 377, 755, 505)),
-            None
-        );
+        assert_eq!(clamp_rect_to_mat(&mat, Rect::new(905, 377, 755, 505)), None);
     }
 }
