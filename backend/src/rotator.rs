@@ -1510,7 +1510,18 @@ impl DefaultRotator {
                     self.monster_park_portal_attempts
                 );
                 self.monster_park_no_enemy_count = 0;
-                self.monster_park_last_portal = None;
+                // Deliberately NOT clearing `monster_park_last_portal` here. The player is
+                // standing on/near the portal right now - exactly the situation where their own
+                // minimap marker is most likely occluding the portal icon (see the field's docs).
+                // Clearing it would force the next attempt to depend on a fresh scan that's likely
+                // to keep failing for that same reason, and since nothing else re-establishes it
+                // while the player never moves off the portal, `last_portal` could stay `None`
+                // forever - permanently blocking the `let Some(portal) = ... else { return }` gate
+                // below on every future tick. That would make this whole retry/escalation path
+                // (including `monster_park_portal_give_up_cycles`'s `Unstuck` escalation) silently
+                // unreachable, leaving the player stuck in `Player::Idle` forever instead of
+                // retrying Up. Keeping the last known position lets `is_at_portal` keep evaluating
+                // true independent of whether a fresh scan succeeds, so retries actually continue.
                 self.monster_park_portal_attempts = 0;
                 self.monster_park_portal_give_up_cycles += 1;
                 if self.monster_park_portal_give_up_cycles >= MONSTER_PARK_PORTAL_GIVE_UP_CYCLE_LIMIT
