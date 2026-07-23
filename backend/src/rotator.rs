@@ -33,9 +33,9 @@ use crate::{
     operation::OperationState,
     pathing::Platform,
     player::{
-        AutoMob, Booster, DOUBLE_JUMP_THRESHOLD, ExchangeBooster, FamiliarsSwap,
-        GRAPPLING_THRESHOLD, Key, Move, NavigateToHuntingGround, Panic, PanicTo, PingPong,
-        PingPongDirection, PlayerAction, PlayerContext, PlayerEntity, Quadrant, UseBooster,
+        AutoMob, Booster, ExchangeBooster, FamiliarsSwap, GRAPPLING_THRESHOLD, Key, Move,
+        NavigateToHuntingGround, Panic, PanicTo, PingPong, PingPongDirection, PlayerAction,
+        PlayerContext, PlayerEntity, Quadrant, UseBooster,
     },
     run::MS_PER_TICK,
     skill::{Skill, SkillKind},
@@ -370,6 +370,22 @@ pub struct DefaultRotator {
     /// dialog via Esc) instead of looping between "give up" and "immediately re-find the same
     /// portal" indefinitely.
     monster_park_portal_give_up_cycles: u32,
+    /// The `target_y` last computed for the portal-approach `Move` (see
+    /// [`DefaultRotator::rotate_monster_park`]'s `same_platform` logic), together with how many
+    /// consecutive times that Move has been reissued targeting that exact same height without
+    /// ever reaching the portal.
+    ///
+    /// `same_platform` freezes `target_y` to the player's current height instead of the portal's
+    /// real detected height, on the assumption the player is already on the right platform - if
+    /// that assumption is wrong (the position read when making the decision doesn't hold up once
+    /// `Player::Moving` re-evaluates a moment later, e.g. a double jump ends up firing after all),
+    /// the frozen height can be one the player physically can't reach, and re-deriving `target_y`
+    /// the same way on every retry reproduces the identical wrong value forever. Once the count
+    /// exceeds [`MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT`], `target_y` is forced to the portal's
+    /// real detected height instead, guaranteeing eventual convergence regardless of why the
+    /// frozen value was wrong. Reset to `(portal_center_y, 0)` whenever `target_y` actually changes
+    /// between reissues (genuine progress) and cleared by [`Self::reset_monster_park_run_state`].
+    monster_park_portal_target_y: Option<(i32, u32)>,
     /// The position of the enemy dot [`DefaultRotator::rotate_monster_park`] last targeted with
     /// [`PlayerAction::AutoMob`].
     ///
@@ -1374,6 +1390,7 @@ impl DefaultRotator {
             self.monster_park_last_portal = None;
             self.monster_park_portal_attempts = 0;
             self.monster_park_portal_give_up_cycles = 0;
+            self.monster_park_portal_target_y = None;
             self.monster_park_target = Some(point);
             self.monster_park_target_missing_count = 0;
 
@@ -1551,6 +1568,7 @@ impl DefaultRotator {
                 // retrying Up. Keeping the last known position lets `is_at_portal` keep evaluating
                 // true independent of whether a fresh scan succeeds, so retries actually continue.
                 self.monster_park_portal_attempts = 0;
+                self.monster_park_portal_target_y = None;
                 self.monster_park_portal_give_up_cycles += 1;
                 if self.monster_park_portal_give_up_cycles >= MONSTER_PARK_PORTAL_GIVE_UP_CYCLE_LIMIT
                 {
@@ -1605,16 +1623,48 @@ impl DefaultRotator {
             // `PORTAL_Y_THRESHOLD` of the portal's height by coincidence. Freezing that transient
             // reading as the target then has the player climb back to it once they actually reach
             // the portal's platform and its real (different) height takes over, instead of just
-            // heading straight for the portal's real height from the start. Gate on the same
-            // horizontal distance Player::Moving itself uses to decide "close enough to not need
-            // a double jump" - past that, we're not plausibly on the portal's platform yet.
-            let same_platform = (portal_center_x - pos.x).abs() < DOUBLE_JUMP_THRESHOLD
+            // heading straight for the portal's real height from the start.
+            //
+            // Gated tightly (much tighter than `DOUBLE_JUMP_THRESHOLD`) rather than on "close
+            // enough that Player::Moving itself wouldn't need a double jump" as originally
+            // reasoned - live testing showed that boundary isn't actually safe: a double jump can
+            // still end up firing between this decision and `Player::Moving`'s own fresh
+            // recomputation a moment later (position drift across that gap), which invalidates
+            // the "already on this platform" assumption `target_y` relies on. Once that happens,
+            // the double jump (and whatever climb follows) can land short of the frozen target
+            // height, and the remaining small gap can fall into a range `Player::Jumping` can't
+            // reliably close, retrying indefinitely. Tightening this substantially shrinks that
+            // window; it doesn't eliminate it, hence the escape hatch below.
+            const SAME_PLATFORM_X_THRESHOLD: i32 = 3;
+            let same_platform = (portal_center_x - pos.x).abs() < SAME_PLATFORM_X_THRESHOLD
                 && (portal_center_y - pos.y).abs() <= PORTAL_Y_THRESHOLD;
-            let target_y = if same_platform {
+            let mut target_y = if same_platform {
                 pos.y
             } else {
                 portal_center_y
             };
+
+            // Escape hatch: if the same (wrong) target_y keeps getting reissued without ever
+            // reaching the portal, re-deriving it the same way again isn't going to help - force
+            // the real detected height instead, guaranteeing convergence regardless of why the
+            // frozen value was wrong in the first place. See `monster_park_portal_target_y`'s docs.
+            const MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT: u32 = 3;
+            let repeats = match self.monster_park_portal_target_y {
+                Some((last_target_y, repeats)) if last_target_y == target_y => repeats + 1,
+                _ => 0,
+            };
+            if repeats >= MONSTER_PARK_PORTAL_TARGET_Y_REPEAT_LIMIT {
+                debug!(
+                    target: "backend/rotator",
+                    "Monster Park: target y {target_y} reissued {repeats} times without reaching \
+                     the portal, forcing real detected height {portal_center_y} instead"
+                );
+                target_y = portal_center_y;
+                self.monster_park_portal_target_y = None;
+            } else {
+                self.monster_park_portal_target_y = Some((target_y, repeats));
+            }
+
             let position = Position {
                 x: portal_center_x,
                 x_random_range: 0,
@@ -1741,6 +1791,7 @@ impl DefaultRotator {
         self.monster_park_last_portal = None;
         self.monster_park_portal_attempts = 0;
         self.monster_park_portal_give_up_cycles = 0;
+        self.monster_park_portal_target_y = None;
         self.monster_park_target = None;
         self.monster_park_target_missing_count = 0;
         self.monster_park_pending_target = None;
