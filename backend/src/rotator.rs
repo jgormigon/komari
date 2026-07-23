@@ -2013,11 +2013,22 @@ impl Rotator for DefaultRotator {
             // infinite loop due to auto mobbing ignoring Any condition
             i += offset;
             match condition {
+                // Both conditions are skipped entirely during Monster Park - map-tied ones
+                // (`ErdaShowerOffCooldown`, and any `EveryMillis` action bound to a specific
+                // position) reference the user's regular farming map, which has nothing to do
+                // with whatever stage Monster Park currently has the player on, and periodic
+                // character-level ones (buffs/skills) are excluded the same way buffs already are
+                // above - Monster Park runs are short and fast-paced enough that maintaining them
+                // isn't worth interrupting mobbing/portal navigation for. Same reasoning applies
+                // for the whole mode session, not just while in the entry lobby, since there's no
+                // meaningful "farming map position" at any point during a Monster Park run.
                 ActionCondition::EveryMillis(_) => {
-                    self.priority_actions.insert(
-                        next_action_id(),
-                        priority_action(action, condition, queue_to_front),
-                    );
+                    if !is_monster_park {
+                        self.priority_actions.insert(
+                            next_action_id(),
+                            priority_action(action, condition, queue_to_front),
+                        );
+                    }
                 }
                 ActionCondition::ErdaShowerOffCooldown => {
                     if !is_monster_park {
@@ -2128,13 +2139,28 @@ impl Rotator for DefaultRotator {
         self.rotate_priority_actions_queue(&mut world.player);
 
         if self.daily_quest_index < self.daily_quest_entries.len() {
-            self.rotate_daily_quest(
-                resources,
-                &mut world.player.context,
-                &mut world.minimap.context,
-                world.minimap.state,
-            );
-            return;
+            // Opening the world map to navigate to a hunting ground isn't possible while standing
+            // in Monster Park's entry lobby - the game doesn't allow it there. If daily quests are
+            // still pending but navigation to the current entry hasn't started yet (so this would
+            // be the point `rotate_daily_quest` tries to open the world map) and the player happens
+            // to be in the lobby (e.g. between Monster Park runs, if that's also the configured
+            // normal mode), fall through to the normal mode dispatch instead so it can move the
+            // player out of the lobby first - daily quest navigation resumes normally once no
+            // longer there. Only checked when nothing is already in flight, same reasoning as the
+            // `RotatorMode::MonsterPark` dispatch below for why that's the only time this matters.
+            let blocked_by_monster_park_entry = !self.daily_quest_navigating
+                && !world.player.context.has_normal_action()
+                && !world.player.context.has_priority_action()
+                && resources.detector().detect_monster_park_entry_map();
+            if !blocked_by_monster_park_entry {
+                self.rotate_daily_quest(
+                    resources,
+                    &mut world.player.context,
+                    &mut world.minimap.context,
+                    world.minimap.state,
+                );
+                return;
+            }
         }
 
         match self.normal_rotate_mode {
@@ -2982,6 +3008,59 @@ mod tests {
         rotator.build_actions(args);
         assert_eq!(rotator.priority_actions.len(), 11);
         assert_eq!(rotator.normal_actions.len(), 2);
+    }
+
+    #[test]
+    fn rotator_build_actions_monster_park_excludes_fixed_actions() {
+        const EVERY_MILLIS_ACTION: Action = Action::Move(ActionMove {
+            position: Position {
+                x: 0,
+                x_random_range: 0,
+                y: 0,
+                allow_adjusting: false,
+            },
+            condition: ActionCondition::EveryMillis(1000),
+            wait_after_move_millis: 0,
+        });
+
+        let mut rotator = DefaultRotator::default();
+        let args = RotatorBuildArgs {
+            mode: RotatorMode::MonsterPark(MobbingKey::default(), Bound::default()),
+            character_level: 1,
+            map_actions: vec![EVERY_MILLIS_ACTION, PRIORITY_ACTION],
+            character_actions: vec![EVERY_MILLIS_ACTION],
+            buffs: vec![(BuffKind::Rune, KeyKind::A); 4],
+            familiars: Familiars::default(),
+            familiar_essence_key: KeyKind::A,
+            elite_boss_behavior: EliteBossBehavior::None,
+            elite_boss_behavior_key: KeyKind::A,
+            hexa_booster_exchange_condition: ExchangeHexaBoosterCondition::None,
+            hexa_booster_exchange_amount: 1,
+            hexa_booster_exchange_all: false,
+            enable_panic_mode: false,
+            enable_rune_solving: false,
+            enable_transparent_shape_solving: false,
+            enable_violetta_solving: false,
+            enable_reset_normal_actions_on_erda: false,
+            enable_using_generic_booster: false,
+            enable_using_hexa_booster: false,
+            daily_quest_entries: vec![],
+            daily_quest_mobbing_key: MobbingKey::default(),
+            daily_quest_character_id: None,
+        };
+
+        rotator.build_actions(args);
+
+        // Neither the map-level nor the character-level EveryMillis action, nor the
+        // ErdaShowerOffCooldown one, should have been registered - only the always-present
+        // unstuck priority action remains.
+        assert_eq!(rotator.priority_actions.len(), 1);
+        assert!(
+            rotator
+                .priority_actions
+                .values()
+                .all(|action| action.condition_kind.is_none())
+        );
     }
 
     #[test]
