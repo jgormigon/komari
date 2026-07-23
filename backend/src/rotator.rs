@@ -261,13 +261,15 @@ pub trait Rotator: Debug + 'static {
     /// The currently built [`RotatorMode`].
     fn mode(&self) -> RotatorMode;
 
-    /// Whether a daily quest entry is currently being navigated to or mobbed at (see
-    /// [`DefaultRotator::daily_quest_navigating`]).
+    /// Whether a daily quest entry is currently being travelled to (see
+    /// [`DefaultRotator::daily_quest_navigating`], [`DefaultRotator::daily_quest_arrived`]).
     ///
     /// Used by the world event handler to exempt the map changes this causes (opening the world
     /// map covers the minimap; teleporting actually changes it) from the "unexpected map change"
     /// watchdog, the same way [`RotatorMode::MonsterPark`] is exempted for its own portal-driven
-    /// map changes.
+    /// map changes. `false` again once the entry's hunting ground is actually reached and mobbing
+    /// starts, so a map change during mobbing (e.g. failing a lie detector check) still trips the
+    /// watchdog.
     fn is_navigating_daily_quest(&self) -> bool;
 
     /// Resets priority and normal actions queues.
@@ -444,6 +446,17 @@ pub struct DefaultRotator {
     /// Reset on [`Self::reset_queue`] (e.g. on pause) since a pause also aborts any in-flight
     /// navigation - unlike [`Self::daily_quest_index`], this is transient per-attempt tracking.
     daily_quest_navigating: bool,
+    /// Whether the entry at [`Self::daily_quest_index`] has been reached and mobbing has started,
+    /// i.e. [`Self::daily_quest_navigating`] is `true` but travel itself has finished.
+    ///
+    /// [`Rotator::is_navigating_daily_quest`] only exempts map changes while this is `false` - the
+    /// world map/teleport-driven changes it exists to exempt only happen during travel itself.
+    /// Once mobbing is underway, a map change (e.g. the player getting bounced to a different map
+    /// after failing a lie detector check) is exactly the kind of unexpected event the "unexpected
+    /// map change" watchdog in [`crate::services::world`] should still catch. Reset alongside
+    /// [`Self::daily_quest_navigating`] on navigation failure, quest completion, and
+    /// [`Self::reset_queue`].
+    daily_quest_arrived: bool,
     /// Background task scanning for the kill-count popup while mobbing at a daily quest's
     /// hunting ground (see [`Self::rotate_daily_quest`]).
     ///
@@ -938,6 +951,7 @@ impl DefaultRotator {
             );
             self.daily_quest_index += 1;
             self.daily_quest_navigating = false;
+            self.daily_quest_arrived = false;
             self.auto_mob_task = None;
             self.auto_mob_quadrant_consecutive_count = None;
             self.daily_quest_progress_task = None;
@@ -946,6 +960,10 @@ impl DefaultRotator {
             self.daily_quest_complete_popup_detected = false;
             return;
         }
+
+        // Reached this point only once travel has actually finished successfully - from here on,
+        // any further map change is no longer part of expected navigation.
+        self.daily_quest_arrived = true;
 
         if let Update::Ok(progress) = update_detection_task(
             resources,
@@ -1003,6 +1021,7 @@ impl DefaultRotator {
                 .mark_daily_quest_completed(self.daily_quest_character_id, entry.id);
             self.daily_quest_index += 1;
             self.daily_quest_navigating = false;
+            self.daily_quest_arrived = false;
             self.auto_mob_task = None;
             self.auto_mob_quadrant_consecutive_count = None;
             self.daily_quest_progress_task = None;
@@ -1777,7 +1796,7 @@ impl Rotator for DefaultRotator {
 
     #[inline]
     fn is_navigating_daily_quest(&self) -> bool {
-        self.daily_quest_navigating
+        self.daily_quest_navigating && !self.daily_quest_arrived
     }
 
     #[cfg_attr(test, concretize)]
@@ -1980,6 +1999,7 @@ impl Rotator for DefaultRotator {
         self.monster_park_enemies.clear();
         self.monster_park_gate_attempts = 0;
         self.daily_quest_navigating = false;
+        self.daily_quest_arrived = false;
         self.daily_quest_progress_task = None;
         self.daily_quest_progress.clear();
         self.daily_quest_complete_task = None;

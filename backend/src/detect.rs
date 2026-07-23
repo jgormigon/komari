@@ -647,19 +647,34 @@ impl Detector for DefaultDetector {
     }
 
     fn detect_transparent_shapes(&self, region: Rect) -> Vec<(Rect, f32)> {
-        detect_transparent_shapes(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_transparent_shapes(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_mushrooms(&self, region: Rect) -> Vec<(Rect, f32)> {
-        detect_violetta_mushrooms(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_violetta_mushrooms(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_face(&self, region: Rect) -> Result<Rect> {
-        detect_violetta_face(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let region = clamp_rect_to_mat(bgr, region)
+            .ok_or_else(|| anyhow!("region is outside of the captured frame"))?;
+        detect_violetta_face(&bgr.roi(region).unwrap())
     }
 
     fn detect_violetta_numbers(&self, region: Rect) -> Vec<Rect> {
-        detect_violetta_numbers(&self.bgr().roi(region).unwrap())
+        let bgr = self.bgr();
+        let Some(region) = clamp_rect_to_mat(bgr, region) else {
+            return Vec::new();
+        };
+        detect_violetta_numbers(&bgr.roi(region).unwrap())
     }
 
     fn detect_world_map_title(&self) -> Result<Rect> {
@@ -681,6 +696,17 @@ impl Detector for DefaultDetector {
     fn detect_quest_complete_popup(&self) -> Result<Rect> {
         detect_quest_complete_popup(self.grayscale())
     }
+}
+
+/// Intersects `region` with `mat`'s bounds, returning `None` if the two don't overlap at all.
+///
+/// `region` is sometimes derived from a detected point plus a fixed offset (e.g. the lie
+/// detector's puzzle area), so it can end up partially or fully outside the actual captured
+/// frame - passing such a `region` straight to [`MatTraitConst::roi`] panics instead of erroring.
+fn clamp_rect_to_mat(mat: &impl MatTraitConst, region: Rect) -> Option<Rect> {
+    let bounds = Rect::new(0, 0, mat.cols(), mat.rows());
+    let clamped = region & bounds;
+    (clamped.width > 0 && clamped.height > 0).then_some(clamped)
 }
 
 fn detect_mobs(
