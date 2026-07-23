@@ -173,6 +173,46 @@ impl Player {
     }
 }
 
+/// Releases any key `state` may currently be holding down (`send_key_down` without a matching
+/// `send_key_up` yet), for when `state` is about to be discarded outside its own normal
+/// completion path.
+///
+/// A handful of states hold a key down across several ticks instead of a single press-and-release
+/// - `Adjusting`/`DoubleJumping`/`Stalling`/`Unstucking` hold Left or Right, `UpJumping` holds Up,
+/// and `UseKey` holds its main key and/or link key (commonly a modifier, for combo skills) when
+/// `key_hold_ticks > 0` or `link_key` is [`crate::bridge::LinkKeyKind::Along`]. All of them only release
+/// what they're holding once their own state naturally completes - `run_system` has a few places
+/// that instead overwrite `player.state` directly (player detection failing entirely, or a pending
+/// reset to `Idle`), bypassing that cleanup and leaving the key held at the OS level indefinitely.
+/// If that's a modifier key, anything else that later sends an unrelated key (e.g. `Unstucking`'s
+/// own Esc-dismiss) can be misread by Windows or the game as a shortcut combo - this is the
+/// direct fix for exactly that class of bug.
+///
+/// Not gated on whether a hold is actually in progress right now for the direction/Up-holding
+/// states - releasing a key that isn't actually down is a harmless no-op at the input layer
+/// (`bridge`'s `send_key_up` is a plain, unconditional key-up simulation), so it's simpler and
+/// safer to release unconditionally than to track each state's precise internal timing here too.
+fn release_keys_held_by(resources: &mut Resources, state: &Player) {
+    match state {
+        Player::Adjusting(_)
+        | Player::DoubleJumping(_)
+        | Player::Stalling(_, _)
+        | Player::Unstucking(_) => {
+            resources.input.send_key_up(KeyKind::Left);
+            resources.input.send_key_up(KeyKind::Right);
+        }
+        Player::UpJumping(_) => {
+            resources.input.send_key_up(KeyKind::Up);
+        }
+        Player::UseKey(use_key) => {
+            for key in use_key.held_keys() {
+                resources.input.send_key_up(key);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn run_system(
     resources: &mut Resources,
     player: &mut PlayerEntity,
@@ -211,6 +251,7 @@ pub fn run_system(
             Minimap::Idle(idle) => !idle.partially_overlapping,
         };
         if is_stucking {
+            release_keys_held_by(resources, &player.state);
             let random = player.context.track_unstucking_transitioned();
             let blink = random && player.context.track_unstucking_gamba();
             let unstucking = Unstucking::new_movement(Timeout::default(), random, blink);
@@ -219,11 +260,13 @@ pub fn run_system(
             return;
         }
 
+        release_keys_held_by(resources, &player.state);
         player.state = Player::Detecting;
         return;
     }
 
     if player.context.reset_to_idle_next_update {
+        release_keys_held_by(resources, &player.state);
         player.context.reset_to_idle_next_update = false;
         player.state = Player::Idle;
     }
@@ -327,5 +370,86 @@ fn update_positional_state(
         | Player::SolvingShape(_)
         | Player::SolvingVioletta(_)
         | Player::CashShopThenExit(_) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mockall::predicate::eq;
+
+    use super::*;
+    use crate::{
+        bridge::{LinkKeyKind, MockInput},
+        models::{ActionKeyDirection, ActionKeyWith, WaitAfterBuffered},
+        player::Key,
+    };
+
+    #[test]
+    fn release_keys_held_by_direction_holding_states_releases_left_and_right() {
+        for state in [
+            Player::Adjusting(Adjusting::new(Moving::new(
+                Point::new(0, 0),
+                Point::new(0, 0),
+                false,
+                None,
+            ))),
+            Player::Stalling(Timeout::default(), 0),
+            Player::Unstucking(Unstucking::new_esc()),
+        ] {
+            let mut keys = MockInput::new();
+            keys.expect_send_key_up().with(eq(KeyKind::Left)).once();
+            keys.expect_send_key_up().with(eq(KeyKind::Right)).once();
+            let mut resources = Resources::new(Some(keys), None);
+
+            release_keys_held_by(&mut resources, &state);
+        }
+    }
+
+    #[test]
+    fn release_keys_held_by_up_jumping_releases_up() {
+        let moving = Moving::new(Point::new(0, 0), Point::new(0, 20), false, None);
+        let mut new_resources = Resources::new(None, None);
+        let up_jumping = UpJumping::new(moving, &mut new_resources, &PlayerContext::default());
+
+        let mut keys = MockInput::new();
+        keys.expect_send_key_up().with(eq(KeyKind::Up)).once();
+        let mut resources = Resources::new(Some(keys), None);
+
+        release_keys_held_by(&mut resources, &Player::UpJumping(up_jumping));
+    }
+
+    #[test]
+    fn release_keys_held_by_use_key_with_along_link_key_releases_both_keys() {
+        let use_key = UseKey::from_key(Key {
+            key: KeyKind::A,
+            key_hold_ticks: 0,
+            key_hold_buffered_to_wait_after: false,
+            link_key: LinkKeyKind::Along(KeyKind::Alt),
+            count: 1,
+            position: None,
+            direction: ActionKeyDirection::Any,
+            with: ActionKeyWith::Any,
+            wait_before_use_ticks: 0,
+            wait_before_use_ticks_random_range: 0,
+            wait_after_use_ticks: 0,
+            wait_after_use_ticks_random_range: 0,
+            wait_after_buffered: WaitAfterBuffered::None,
+        });
+
+        let mut keys = MockInput::new();
+        keys.expect_send_key_up().with(eq(KeyKind::A)).once();
+        keys.expect_send_key_up().with(eq(KeyKind::Alt)).once();
+        let mut resources = Resources::new(Some(keys), None);
+
+        release_keys_held_by(&mut resources, &Player::UseKey(use_key));
+    }
+
+    #[test]
+    fn release_keys_held_by_idle_does_nothing() {
+        let mut keys = MockInput::new();
+        keys.expect_send_key_up().never();
+        let mut resources = Resources::new(Some(keys), None);
+
+        release_keys_held_by(&mut resources, &Player::Idle);
     }
 }
