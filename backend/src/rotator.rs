@@ -1610,6 +1610,20 @@ impl DefaultRotator {
         player_context: &mut PlayerContext,
         minimap_state: Minimap,
     ) {
+        // This is only ever called once the caller (`rotate_action`'s `RotatorMode::MonsterPark`
+        // dispatch) has freshly, synchronously confirmed the player is genuinely back in the
+        // entry lobby - i.e. the previous run (if any) has definitely ended. Reset the run-scoped
+        // Monster Park state right here rather than waiting until actually standing at the gate:
+        // a run's end and the next run's start happen without a rotator rebuild in between (same
+        // "MP" map config the whole time), so without resetting somewhere in between, the previous
+        // run's leftover state (last portal position, an already-saturated no-enemy counter) could
+        // be mistaken for this run's own progress once enemy scanning restarts. Resetting as soon
+        // as the lobby is confirmed - instead of only right before the gate hand-off - closes that
+        // gap immediately rather than relying on `rotate_monster_park`'s own early-return checks to
+        // stay safe for however long it takes to walk to the gate. Harmless to repeat on every
+        // call while still walking there (already-zeroed fields, cheap).
+        self.reset_monster_park_run_state();
+
         if player_context.has_normal_action() {
             return;
         }
@@ -1677,15 +1691,8 @@ impl DefaultRotator {
 
         // At the gate - hand off to `Player::EnteringMonsterPark`, which presses Up and drives
         // the whole dungeon-select dialog from here. This rotator's job stops at getting the
-        // player to the right spot.
-        //
-        // Resetting here rather than only in `reset_queue` matters because a run's end and the
-        // next run's start happen without a rotator rebuild in between (same "MP" map config the
-        // whole time) - without this, the previous run's leftover state (last portal position, an
-        // already-saturated no-enemy counter) would be mistaken for this run's own progress the
-        // moment enemy scanning restarts, sending the player straight to a stale portal instead of
-        // mobbing the new run's first stage.
-        self.reset_monster_park_run_state();
+        // player to the right spot. Run state was already reset when this function was first
+        // entered (see the top of the function), so nothing further to clear here.
         player_context.set_priority_action(None, PlayerAction::EnterMonsterPark);
         debug!(target: "backend/rotator", "Monster Park Entry: at gate, entering Monster Park");
     }
@@ -1693,12 +1700,12 @@ impl DefaultRotator {
     /// Resets the run-scoped Monster Park state tracked across [`Self::rotate_monster_park`]
     /// ticks (enemy/portal caches and their debounce counters).
     ///
-    /// Called both on a full rotator rebuild ([`Self::reset_queue`]) and right before handing off
-    /// to a fresh run at the entry gate ([`Self::rotate_monster_park_entry`]) - a run's end and
-    /// the next run's start happen without a rebuild in between (same "MP" map config the whole
-    /// time), so without this second call site, state left over from the previous run (e.g. the
-    /// last stage's portal position, an already-saturated no-enemy counter) would otherwise carry
-    /// into the new run and be mistaken for this run's own progress.
+    /// Called both on a full rotator rebuild ([`Self::reset_queue`]) and as soon as the player is
+    /// confirmed back in the entry lobby ([`Self::rotate_monster_park_entry`]'s entry point) - a
+    /// run's end and the next run's start happen without a rebuild in between (same "MP" map
+    /// config the whole time), so without this second call site, state left over from the previous
+    /// run (e.g. the last stage's portal position, an already-saturated no-enemy counter) would
+    /// otherwise carry into the new run and be mistaken for this run's own progress.
     #[inline]
     fn reset_monster_park_run_state(&mut self) {
         self.monster_park_no_enemy_count = 0;
