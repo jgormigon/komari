@@ -390,12 +390,12 @@ pub(super) fn update_from_auto_mob_action(
         direction if direction < 0 => ActionKeyDirection::Left,
         _ => ActionKeyDirection::Any,
     };
-    let should_check_pathing = matches!(
+    let is_mid_air = matches!(
         player.state,
         Player::DoubleJumping(_) | Player::Adjusting(_)
     );
 
-    if should_check_pathing
+    if is_mid_air
         && player
             .context
             .auto_mob_pathing_should_use_key(resources, minimap_state)
